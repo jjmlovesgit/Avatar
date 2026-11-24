@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+*.so
+.venv/
+venv/
+.pytest_cache/
+
+# Node / Electron
+node_modules/
+dist/
+out/
+
+# Large model weights & runtime artifacts (keep out of Git)
+backend/checkpoints/
+backend/whisper_models/
+backend/chunks/
+backend/uploads/
+backend/tts_temp/
+backend/generated_clips/
+*.ckpt
+*.safetensors
+*.pt
+*.pth
+*.bin
+
+# Backups, temp files & OS clutter
+backup_*/
+*.bak
+*.bak.*
+*.log
+.DS_Store
+Thumbs.db
+.vscode/
+.env

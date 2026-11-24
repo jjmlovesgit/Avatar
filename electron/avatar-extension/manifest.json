@@ -1,0 +1,45 @@
+{
+  "manifest_version": 3,
+  "name": "Send to Avatar Studio",
+  "version": "1.3",
+  "description": "Right-click text → Avatar read aloud",
+  "permissions": [
+    "contextMenus",
+    "storage",
+    "scripting",
+    "activeTab"
+  ],
+  "host_permissions": [
+    "http://localhost:8003/*",
+    "http://127.0.0.1:8003/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "<all_urls>"
+      ],
+      "js": [
+        "content_highlight_phase1.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "commands": {
+    "send-selected-text": {
+      "suggested_key": {
+        "default": "Ctrl+Shift+S",
+        "mac": "Command+Shift+S"
+      },
+      "description": "Send selected text to Avatar"
+    }
+  },
+  "icons": {
+    "16": "icon.png",
+    "32": "icon.png",
+    "48": "icon.png",
+    "128": "icon.png"
+  }
+}

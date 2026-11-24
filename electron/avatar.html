@@ -1,0 +1,1512 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Avatar Reader</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+            user-select: none;
+        }
+
+        html, body {
+            background: transparent !important;
+            overflow: hidden;
+            height: 100%;
+            width: 100%;
+        }
+
+        body {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: flex-start;
+            position: relative;
+        }
+
+        .drag-bar {
+            width: 100%;
+            height: 35px;
+            -webkit-app-region: drag;
+            background: transparent !important;
+            backdrop-filter: none !important;
+            cursor: grab;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: transparent;
+            font-size: 0;
+            letter-spacing: 0;
+        }
+
+        .drag-bar:hover {
+            background: transparent !important;
+        }
+
+        .video-wrapper {
+            width: 256px;
+            height: 256px;
+            margin: 0 auto;
+            overflow: hidden;
+            background: #000;
+            border: 2px solid #111;
+            position: relative;
+            border-radius: 5px;
+        }
+
+        .video-container {
+            position: relative;
+            width: 100%;
+            height: 100%;
+            background: #000;
+            border-radius: 5px;
+            overflow: hidden;
+        }
+
+        .video-container::before {
+            content: '';
+            position: absolute;
+            inset: 0;
+            background-image: var(--avatar-bg-url, url('Johnny-Depp.png'));
+            background-size: cover;
+            background-position: center;
+            background-repeat: no-repeat;
+            z-index: 1;
+            border-radius: 5px;
+            opacity: 1;
+            display: block;
+            pointer-events: none;
+        }
+
+        #v_idle,
+        #v1,
+        #v2 {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+            border-radius: 5px;
+            background: transparent;
+            transition: opacity 180ms linear;
+        }
+
+        #v_idle {
+            opacity: 0;
+            z-index: 5;
+        }
+
+        #v1,
+        #v2 {
+            opacity: 0;
+            z-index: 2;
+        }
+
+        #v1.active,
+        #v2.active {
+            opacity: 1 !important;
+            z-index: 50 !important;
+            display: block !important;
+            visibility: visible !important;
+        }
+
+        .status-led {
+            position: absolute;
+            top: 8px;
+            right: 8px;
+            width: 20px;
+            height: 20px;
+            border-radius: 50%;
+            background-color: rgb(7, 211, 7);
+            opacity: 0.95;
+            transition: box-shadow 0.1s ease;
+            pointer-events: none;
+            z-index: 100;
+        }
+
+        .status-led.blink {
+            animation: blink-green 1.5s step-start infinite;
+        }
+
+        @keyframes blink-green {
+            0%, 100% {
+                opacity: 0.85;
+                background-color: #0f0;
+            }
+
+            50% {
+                opacity: 0.3;
+                background-color: #0a0;
+            }
+        }
+
+        .status-led.recording {
+            animation: none;
+            background-color: red !important;
+        }
+
+        .status-led.sleeping {
+            animation: none;
+            background-color: rgb(7, 211, 7) !important;
+            opacity: 0.95;
+            box-shadow: none;
+        }
+
+        .status-led.wake-active {
+            animation: none;
+            background-color: #00ff66 !important;
+            opacity: 0.95;
+            box-shadow: 0 0 14px rgba(0, 255, 102, 0.9);
+        }
+
+
+        /* Highest-priority playback / processing blink.
+           This comes after sleeping/wake-active so those states cannot
+           accidentally cancel the animation while video is playing. */
+        .status-led.blink,
+        .status-led.blink.sleeping,
+        .status-led.blink.wake-active {
+            animation: blink-green 0.65s ease-in-out infinite !important;
+            background-color: #00ff00 !important;
+            box-shadow: 0 0 18px rgba(0, 255, 0, 0.95) !important;
+        }
+    </style>
+</head>
+
+<body>
+
+<div class="drag-bar"></div>
+
+<div class="video-wrapper">
+    <div class="video-container">
+        <video id="v_idle" src="idle4.mp4" autoplay loop muted playsinline preload="auto"></video>
+        <video id="v1" playsinline></video>
+        <video id="v2" playsinline></video>
+        <div id="statusLed" class="status-led"></div>
+    </div>
+</div>
+
+<script>
+    const BACKEND_URL = 'http://localhost:8002';
+    const DEFAULT_VOICE = 'jonnydepp';
+    let IDLE_VIDEO_SRC = 'idle4.mp4';
+
+    async function syncAvatarProfileFromBackend() {
+        try {
+            const res = await fetch(`${BACKEND_URL}/avatar/profile`);
+            if (!res.ok) return;
+            const cfg = await res.json();
+            const container = document.querySelector('.video-container');
+            if (container && cfg.avatar_file) {
+                container.style.setProperty('--avatar-bg-url', `url('${cfg.avatar_file}')`);
+            }
+            if (cfg.idle_file && cfg.idle_file !== IDLE_VIDEO_SRC) {
+                IDLE_VIDEO_SRC = cfg.idle_file;
+                initializeIdleVideo();
+                if (!isPlaying) {
+                    playIdleVideo();
+                }
+            }
+            console.log('🎭 Synced avatar profile from backend:', cfg.profile, cfg.avatar_file, cfg.idle_file);
+        } catch (err) {
+            console.warn('Avatar profile sync skipped (using defaults):', err);
+        }
+    }
+
+    const statusLed = document.getElementById('statusLed');
+    const vIdle = document.getElementById('v_idle');
+    const v1 = document.getElementById('v1');
+    const v2 = document.getElementById('v2');
+
+    let videoQueue = [];
+    let isPlaying = false;
+    let currentAudio = null;
+    let abortCurrentSession = false;
+    let playbackToken = 0;
+    let forceBlinkDuringPlayback = false;
+
+    let mediaRecorder = null;
+    let audioChunks = [];
+    let isRecordingActive = false;
+    let recordingStream = null;
+
+    // Realtime wake word + VAD WebSocket state.
+    // The backend owns wake-word detection and VAD; Electron only streams mic PCM.
+    let realtimeWs = null;
+    let realtimeStream = null;
+    let realtimeAudioContext = null;
+    let realtimeSource = null;
+    let realtimeProcessor = null;
+    let realtimeReconnectTimer = null;
+    let realtimeReconnectAttempts = 0;
+    let realtimeEnabled = true;
+    let realtimePausedForManualRecording = false;
+    let realtimeSessionToken = 0;
+
+    function initializeIdleVideo() {
+        vIdle.src = IDLE_VIDEO_SRC;
+        vIdle.loop = true;
+        vIdle.muted = true;
+        vIdle.defaultMuted = true;
+        vIdle.autoplay = true;
+        vIdle.playsInline = true;
+        vIdle.setAttribute('playsinline', 'true');
+        vIdle.setAttribute('muted', 'true');
+        vIdle.preload = 'auto';
+
+        vIdle.onerror = (err) => {
+            console.warn('Idle video unavailable, falling back to PNG background:', err);
+            vIdle.style.opacity = '0';
+        };
+
+        vIdle.onloadedmetadata = () => {
+            console.log(
+                '🧘 Idle video loaded:',
+                'duration=', vIdle.duration,
+                'videoWidth=', vIdle.videoWidth,
+                'videoHeight=', vIdle.videoHeight,
+                'src=', vIdle.currentSrc || vIdle.src
+            );
+        };
+
+        vIdle.onended = () => {
+            // Safety net in case Chromium ever fires ended despite loop=true
+            vIdle.currentTime = 0;
+            vIdle.play().catch(() => {});
+        };
+
+        vIdle.load();
+    }
+
+    function playIdleVideo() {
+        if (!vIdle.src) {
+            initializeIdleVideo();
+        }
+
+        vIdle.loop = true;
+        vIdle.muted = true;
+        vIdle.defaultMuted = true;
+        vIdle.volume = 0;
+        vIdle.style.opacity = '1';
+        vIdle.style.zIndex = '5';
+        vIdle.style.display = 'block';
+        vIdle.style.visibility = 'visible';
+
+        if (vIdle.ended) {
+            try { vIdle.currentTime = 0; } catch {}
+        }
+
+        vIdle.play().catch(err => {
+            console.warn('Idle video play failed, PNG background remains visible:', err);
+        });
+    }
+
+    function hideIdleVideo() {
+        vIdle.style.opacity = '0';
+        vIdle.style.zIndex = '1';
+    }
+
+    function setProcessing(active) {
+        if (active) {
+            window.setLedState('processing');
+        } else {
+            if (forceBlinkDuringPlayback || isPlaying || videoQueue.length > 0) {
+                return;
+            }
+
+            if (!isRecordingActive) {
+                window.setLedState('listening');
+            }
+        }
+    }
+
+    function setRecording(active) {
+        if (active) {
+            if (forceBlinkDuringPlayback || isPlaying || videoQueue.length > 0) {
+                window.setLedState('processing');
+                return;
+            }
+
+            window.setLedState('recording');
+        } else {
+            if (forceBlinkDuringPlayback || isPlaying || videoQueue.length > 0) {
+                window.setLedState('processing');
+            } else {
+                window.setLedState('listening');
+            }
+        }
+    }
+
+
+    
+    // Unified LED state machine used by:
+    // 1. Wake word / VAD realtime path
+    // 2. Ctrl+Shift+Space hotkey path
+    // 3. External/right-click text path from main.js
+    window.setLedState = function setLedState(state) {
+        if (!statusLed) return;
+
+        statusLed.classList.remove('blink', 'recording', 'sleeping', 'wake-active');
+        statusLed.style.animation = '';
+        statusLed.style.backgroundColor = '';
+        statusLed.style.boxShadow = '';
+
+        switch (state) {
+            case 'recording':
+                statusLed.classList.add('recording');
+                break;
+
+            case 'processing':
+            case 'playing':
+                statusLed.classList.add('blink');
+                statusLed.style.animation = 'blink-green 0.65s ease-in-out infinite';
+                statusLed.style.backgroundColor = '#00ff00';
+                statusLed.style.boxShadow = '0 0 18px rgba(0, 255, 0, 0.95)';
+                break;
+
+            case 'sleeping':
+                statusLed.classList.add('sleeping');
+                break;
+
+            case 'active':
+            case 'speaking':
+            case 'listening':
+                statusLed.classList.add('wake-active');
+                break;
+
+            case 'idle':
+            default:
+                // Solid green default.
+                break;
+        }
+    };
+
+function setWakewordVisual(status) {
+        if (statusLed.classList.contains('blink') || isPlaying || videoQueue.length > 0) {
+            return;
+        }
+
+        if (isRecordingActive) {
+            return;
+        }
+
+        if (status === 'sleeping') {
+            window.setLedState('sleeping');
+        } else if (status === 'active' || status === 'speaking' || status === 'listening') {
+            window.setLedState(status);
+        } else {
+            window.setLedState('listening');
+        }
+    }
+
+    function downsampleTo16kInt16(inputBuffer, inputSampleRate) {
+        if (inputSampleRate === 16000) {
+            const output = new Int16Array(inputBuffer.length);
+
+            for (let i = 0; i < inputBuffer.length; i++) {
+                const sample = Math.max(-1, Math.min(1, inputBuffer[i]));
+                output[i] = sample < 0 ? sample * 0x8000 : sample * 0x7fff;
+            }
+
+            return output;
+        }
+
+        const sampleRateRatio = inputSampleRate / 16000;
+        const newLength = Math.round(inputBuffer.length / sampleRateRatio);
+        const output = new Int16Array(newLength);
+        let offsetResult = 0;
+        let offsetBuffer = 0;
+
+        while (offsetResult < output.length) {
+            const nextOffsetBuffer = Math.round((offsetResult + 1) * sampleRateRatio);
+            let accum = 0;
+            let count = 0;
+
+            for (let i = offsetBuffer; i < nextOffsetBuffer && i < inputBuffer.length; i++) {
+                accum += inputBuffer[i];
+                count += 1;
+            }
+
+            const sample = Math.max(-1, Math.min(1, accum / Math.max(1, count)));
+            output[offsetResult] = sample < 0 ? sample * 0x8000 : sample * 0x7fff;
+            offsetResult += 1;
+            offsetBuffer = nextOffsetBuffer;
+        }
+
+        return output;
+    }
+
+    async function stopRealtimeWakewordListener({ reconnect = false } = {}) {
+        realtimeEnabled = reconnect;
+
+        if (realtimeReconnectTimer) {
+            clearTimeout(realtimeReconnectTimer);
+            realtimeReconnectTimer = null;
+        }
+
+        try {
+            if (realtimeProcessor) {
+                realtimeProcessor.disconnect();
+                realtimeProcessor.onaudioprocess = null;
+            }
+        } catch {}
+
+        try {
+            if (realtimeSource) {
+                realtimeSource.disconnect();
+            }
+        } catch {}
+
+        try {
+            if (realtimeAudioContext && realtimeAudioContext.state !== 'closed') {
+                await realtimeAudioContext.close();
+            }
+        } catch {}
+
+        try {
+            if (realtimeStream) {
+                realtimeStream.getTracks().forEach(track => track.stop());
+            }
+        } catch {}
+
+        try {
+            if (realtimeWs && realtimeWs.readyState === WebSocket.OPEN) {
+                realtimeWs.close(1000, 'client stopping realtime listener');
+            }
+        } catch {}
+
+        realtimeProcessor = null;
+        realtimeSource = null;
+        realtimeAudioContext = null;
+        realtimeStream = null;
+        realtimeWs = null;
+
+        if (!reconnect) {
+            setWakewordVisual(null);
+        }
+    }
+
+    function scheduleRealtimeReconnect() {
+        if (!realtimeEnabled || realtimePausedForManualRecording || realtimeReconnectTimer) {
+            return;
+        }
+
+        const delay = Math.min(10000, 1000 * Math.max(1, realtimeReconnectAttempts));
+        realtimeReconnectAttempts += 1;
+
+        realtimeReconnectTimer = setTimeout(() => {
+            realtimeReconnectTimer = null;
+            startRealtimeWakewordListener().catch(err => {
+                console.error('Realtime wakeword reconnect failed:', err);
+                scheduleRealtimeReconnect();
+            });
+        }, delay);
+    }
+
+    function handleRealtimeMessage(data) {
+        switch (data.type) {
+            case 'ready':
+                console.log('✅ Realtime wakeword ready:', data);
+                setWakewordVisual(data.wakeword_enabled ? 'sleeping' : 'active');
+                break;
+
+            case 'status_update':
+                if (data.status === 'idle') {
+                    setWakewordVisual('sleeping');
+                } else if (data.status === 'active' || data.status === 'speaking' || data.status === 'listening') {
+                    setWakewordVisual(data.status);
+                } else if (data.status === 'processing' || data.status === 'generating' || data.status === 'transcribing') {
+                    setProcessing(true);
+                }
+                break;
+
+            case 'wakeword_activated':
+            case 'wakeword_detected':
+                console.log('🎯 Wake word activated');
+                setWakewordVisual('active');
+                break;
+
+            case 'wakeword_deactivated':
+            case 'wakeword_timeout':
+                console.log('💤 Wake word listener sleeping');
+                setProcessing(false);
+                setWakewordVisual('sleeping');
+                break;
+
+            case 'speech_started':
+                if (isPlaying || videoQueue.length > 0 || forceBlinkDuringPlayback || currentAudio) {
+                    bargeInStopPlayback('wakeword speech_started');
+                    realtimeSessionToken = playbackToken;
+                }
+                setWakewordVisual('speaking');
+                break;
+
+            case 'processing_started':
+                setProcessing(true);
+                break;
+
+            case 'clear_video':
+                clearVideoQueue();
+                // clearVideoQueue increments playbackToken, so refresh the realtime
+                // token before chunk_ready events arrive. Otherwise the queue
+                // treats realtime chunks as stale and skips playback.
+                realtimeSessionToken = playbackToken;
+                setProcessing(true);
+                break;
+
+            case 'transcript':
+                if (data.partial) {
+                    console.log('📝 Wakeword transcript partial:', data.text);
+                } else {
+                    console.log('📝 Wakeword transcript complete:', data.text, data.response);
+                }
+                break;
+
+            case 'chunk_ready': {
+                const url = `${BACKEND_URL}${data.url}`;
+                const mime = data.mime || 'video/mp4; codecs="avc1.42E01F, mp4a.40.2"';
+                console.log('📦 Wakeword realtime chunk ready:', data.chunk, data.format || 'mp4', url);
+                forceBlinkDuringPlayback = true;
+                setProcessing(true);
+                if (data.format === 'fmp4' && window.MediaSource && MediaSource.isTypeSupported(mime)) {
+                    enqueueMseChunk(url, mime, realtimeSessionToken);
+                } else {
+                    enqueueVideo(url, realtimeSessionToken);
+                }
+                break;
+            }
+
+            case 'audio_response':
+                clearVideoQueue();
+                forceBlinkDuringPlayback = true;
+                setProcessing(true);
+                currentAudio = new Audio(`${BACKEND_URL}${data.url}`);
+                currentAudio.onended = () => {
+                    forceBlinkDuringPlayback = false;
+                    setProcessing(false);
+                    showBaseAvatar();
+                };
+                currentAudio.play().catch(e => console.error('Realtime audio response error:', e));
+                break;
+
+            case 'complete':
+                console.log('✅ Wakeword realtime response complete');
+                finishMseStream(realtimeSessionToken);
+                // Do not stop blinking here: the backend may send complete as soon
+                // as chunks are generated, while the avatar may still be playing.
+                // playNextVideo() / MSE onended turns blinking off when playback drains.
+                break;
+
+            case 'error':
+                console.warn('Realtime backend error:', data.message || data);
+                if (mseState) {
+                    finishMseStream(mseState.token);
+                }
+                setProcessing(false);
+                break;
+        }
+    }
+
+    async function startRealtimeWakewordListener() {
+        if (!realtimeEnabled || realtimePausedForManualRecording) {
+            return;
+        }
+
+        if (realtimeWs && realtimeWs.readyState === WebSocket.OPEN) {
+            return;
+        }
+
+        await stopRealtimeWakewordListener({ reconnect: true });
+
+        realtimeEnabled = true;
+
+        // Do NOT bump playbackToken while a response video is queued or playing.
+        // The manual hotkey path resumes the realtime wakeword listener immediately
+        // after queueing chunks, but before playback has actually started/finished.
+        // Bumping playbackToken here marks the queued video as stale and prevents play().
+        if (isPlaying || videoQueue.length > 0 || forceBlinkDuringPlayback) {
+            realtimeSessionToken = playbackToken;
+        } else {
+            realtimeSessionToken = ++playbackToken;
+        }
+
+        abortCurrentSession = false;
+
+        const wsUrl = `${BACKEND_URL.replace('http://', 'ws://').replace('https://', 'wss://')}/ws/realtime/${DEFAULT_VOICE}`;
+        realtimeWs = new WebSocket(wsUrl);
+        realtimeWs.binaryType = 'arraybuffer';
+
+        realtimeWs.onopen = async () => {
+            console.log('🔌 Realtime wakeword WebSocket connected');
+            realtimeReconnectAttempts = 0;
+
+            try {
+                realtimeStream = await navigator.mediaDevices.getUserMedia({
+                    audio: {
+                        channelCount: 1,
+                        echoCancellation: true,
+                        noiseSuppression: true,
+                        autoGainControl: true
+                    }
+                });
+
+                realtimeAudioContext = new (window.AudioContext || window.webkitAudioContext)();
+                realtimeSource = realtimeAudioContext.createMediaStreamSource(realtimeStream);
+                realtimeProcessor = realtimeAudioContext.createScriptProcessor(4096, 1, 1);
+
+                realtimeProcessor.onaudioprocess = event => {
+                    if (!realtimeWs || realtimeWs.readyState !== WebSocket.OPEN || realtimePausedForManualRecording) {
+                        return;
+                    }
+
+                    const channelData = event.inputBuffer.getChannelData(0);
+                    const pcm16 = downsampleTo16kInt16(channelData, realtimeAudioContext.sampleRate);
+
+                    if (pcm16.length > 0) {
+                        realtimeWs.send(pcm16.buffer);
+                    }
+                };
+
+                realtimeSource.connect(realtimeProcessor);
+                realtimeProcessor.connect(realtimeAudioContext.destination);
+
+                console.log('🎤 Realtime mic stream started for wakeword/VAD');
+            } catch (err) {
+                console.error('Realtime microphone error:', err);
+                await stopRealtimeWakewordListener({ reconnect: true });
+                scheduleRealtimeReconnect();
+            }
+        };
+
+        realtimeWs.onmessage = event => {
+            try {
+                handleRealtimeMessage(JSON.parse(event.data));
+            } catch (err) {
+                console.warn('Could not parse realtime message:', event.data, err);
+            }
+        };
+
+        realtimeWs.onerror = err => {
+            console.error('Realtime wakeword WebSocket error:', err);
+        };
+
+        realtimeWs.onclose = event => {
+            console.log('🔌 Realtime wakeword WebSocket closed:', event.code, event.reason);
+            realtimeWs = null;
+            scheduleRealtimeReconnect();
+        };
+    }
+
+    function showBaseAvatar() {
+        playIdleVideo();
+
+        [v1, v2].forEach(video => {
+            video.classList.remove('active');
+            video.style.opacity = '0';
+            video.style.zIndex = '2';
+            video.style.display = 'block';
+            video.style.visibility = 'visible';
+        });
+    }
+
+    function showLipSyncVideo(video) {
+        hideIdleVideo();
+
+        video.classList.add('active');
+        video.style.opacity = '1';
+        video.style.zIndex = '50';
+        video.style.display = 'block';
+        video.style.visibility = 'visible';
+    }
+
+    async function startRecording() {
+        if (isRecordingActive) {
+            console.log('Recording already active');
+            return;
+        }
+
+        if (isPlaying || videoQueue.length > 0 || forceBlinkDuringPlayback || currentAudio) {
+            bargeInStopPlayback('manual hotkey startRecording');
+        }
+
+        realtimePausedForManualRecording = true;
+        await stopRealtimeWakewordListener({ reconnect: false });
+
+        try {
+            recordingStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+            mediaRecorder = new MediaRecorder(recordingStream);
+            audioChunks = [];
+
+            mediaRecorder.ondataavailable = (event) => {
+                if (event.data.size > 0) {
+                    audioChunks.push(event.data);
+                }
+            };
+
+            mediaRecorder.onstop = async () => {
+                if (recordingStream) {
+                    recordingStream.getTracks().forEach(track => track.stop());
+                    recordingStream = null;
+                }
+
+                const audioBlob = new Blob(audioChunks, { type: 'audio/webm' });
+
+                if (audioBlob.size === 0) {
+                    console.log('No audio captured');
+                    setRecording(false);
+                    isRecordingActive = false;
+                    realtimePausedForManualRecording = false;
+                    realtimeEnabled = true;
+                    startRealtimeWakewordListener().catch(err => console.error('Failed to resume realtime wakeword listener:', err));
+                    return;
+                }
+
+                setProcessing(true);
+                setRecording(false);
+
+                try {
+                    const formData = new FormData();
+                    formData.append('audio', audioBlob, 'voice.webm');
+                    formData.append('voice', DEFAULT_VOICE);
+                    formData.append('transcribe_only', 'true');
+
+                    const response = await fetch(`${BACKEND_URL}/chat`, {
+                        method: 'POST',
+                        body: formData
+                    });
+
+                    const result = await response.json();
+
+                    if (result.transcript && result.transcript.trim()) {
+                        await speakLlmResponse(result.transcript);
+                    } else {
+                        console.warn('No transcription returned');
+                        setProcessing(false);
+                    }
+                } catch (err) {
+                    console.error('Transcription error:', err);
+                    setProcessing(false);
+                }
+
+                isRecordingActive = false;
+                realtimePausedForManualRecording = false;
+                realtimeEnabled = true;
+                startRealtimeWakewordListener().catch(err => console.error('Failed to resume realtime wakeword listener:', err));
+            };
+
+            mediaRecorder.start(100);
+            isRecordingActive = true;
+            setRecording(true);
+            console.log('🎙️ Recording started');
+        } catch (err) {
+            console.error('Microphone error:', err);
+            setRecording(false);
+            isRecordingActive = false;
+            realtimePausedForManualRecording = false;
+            realtimeEnabled = true;
+            startRealtimeWakewordListener().catch(resumeErr => console.error('Failed to resume realtime wakeword listener:', resumeErr));
+        }
+    }
+
+    function stopRecordingAndSend() {
+        if (mediaRecorder && mediaRecorder.state === 'recording') {
+            mediaRecorder.stop();
+            console.log('⏹️ Recording stopped, sending for transcription');
+        } else {
+            setRecording(false);
+            isRecordingActive = false;
+        }
+    }
+
+
+    function bargeInStopPlayback(reason) {
+        console.log('🛑 Barge-in stopping playback:', reason);
+
+        resetMsePlayer();
+        playbackToken += 1;
+        abortCurrentSession = true;
+        videoQueue = [];
+        isPlaying = false;
+        forceBlinkDuringPlayback = false;
+
+        [v1, v2].forEach(video => {
+            try {
+                video.pause();
+                video.loop = false;
+                video.removeAttribute('src');
+                video.load();
+                video.style.opacity = '0';
+                video.style.zIndex = '2';
+                video.classList.remove('active');
+                video.onended = null;
+                video.onerror = null;
+                video.oncanplay = null;
+                video.onloadeddata = null;
+                video.oncanplaythrough = null;
+            } catch (err) {
+                console.warn('Barge-in video cleanup error:', err);
+            }
+        });
+
+        if (currentAudio) {
+            try {
+                currentAudio.pause();
+                currentAudio.src = '';
+            } catch {}
+            currentAudio = null;
+        }
+
+        showBaseAvatar();
+
+        if (window.setLedState) {
+            window.setLedState('recording');
+        } else {
+            setRecording(true);
+        }
+    }
+
+    function clearVideoQueue() {
+        resetMsePlayer();
+        playbackToken += 1;
+        abortCurrentSession = true;
+        videoQueue = [];
+        isPlaying = false;
+        forceBlinkDuringPlayback = false;
+
+        [v1, v2].forEach(video => {
+            video.pause();
+            video.loop = false;
+            video.removeAttribute('src');
+            video.load();
+            video.style.opacity = '0';
+            video.style.zIndex = '2';
+            video.classList.remove('active');
+            video.onended = null;
+            video.onerror = null;
+            video.oncanplay = null;
+        });
+
+        if (currentAudio) {
+            currentAudio.pause();
+            currentAudio = null;
+        }
+
+        showBaseAvatar();
+    }
+
+    // ============================================
+    // SINGLE-STREAM MSE fMP4 PLAYER (Option 2)
+    // Appends continuous fMP4 chunks into one MediaSource SourceBuffer
+    // in 'sequence' mode so there are zero <video> element swaps or flashes.
+    // Includes an EOF/stall watchdog because Chromium MSE can stop 20-80ms
+    // short of MediaSource.duration when AAC & H.264 track durations differ.
+    // ============================================
+    let mseState = null;
+
+    function completeMsePlayback(state, reason) {
+        if (mseState !== state) return;
+        console.log(`✅ MSE continuous stream playback ended (${reason})`);
+        resetMsePlayer();
+        isPlaying = false;
+        forceBlinkDuringPlayback = false;
+        showBaseAvatar();
+        if (window.setLedState) {
+            window.setLedState('listening');
+        }
+    }
+
+    function startMseWatchdog(state) {
+        if (state.watchdogTimer) return;
+        state.lastTime = -1;
+        state.lastProgressAt = performance.now();
+
+        state.watchdogTimer = setInterval(() => {
+            if (mseState !== state) {
+                clearInterval(state.watchdogTimer);
+                state.watchdogTimer = null;
+                return;
+            }
+            const video = state.video;
+            const now = performance.now();
+            const ct = Number.isFinite(video.currentTime) ? video.currentTime : 0;
+
+            if (Math.abs(ct - state.lastTime) > 0.005) {
+                state.lastTime = ct;
+                state.lastProgressAt = now;
+            }
+
+            const stalledMs = now - state.lastProgressAt;
+            const hasBuf = video.buffered && video.buffered.length > 0;
+            const bufEnd = hasBuf ? video.buffered.end(video.buffered.length - 1) : 0;
+            const dur = Number.isFinite(video.duration) ? video.duration : bufEnd;
+            const targetEnd = Math.max(bufEnd, Number.isFinite(dur) ? dur : 0);
+            const nearEnd = hasBuf && (ct >= bufEnd - 0.25 || (targetEnd > 0 && ct >= targetEnd - 0.25));
+
+            if (state.endedStream) {
+                if (state.appendedCount === 0) {
+                    completeMsePlayback(state, 'watchdog-empty');
+                    return;
+                }
+                if (video.ended) {
+                    completeMsePlayback(state, 'watchdog-video-ended');
+                    return;
+                }
+                if (state.startedPlayback && nearEnd && (stalledMs >= 280 || video.paused)) {
+                    completeMsePlayback(state, `watchdog-eof ct=${ct.toFixed(2)} bufEnd=${bufEnd.toFixed(2)}`);
+                    return;
+                }
+                if (state.startedPlayback && stalledMs >= 1500) {
+                    completeMsePlayback(state, `watchdog-post-eos-stall ct=${ct.toFixed(2)} bufEnd=${bufEnd.toFixed(2)}`);
+                    return;
+                }
+            } else if (state.startedPlayback && state.pendingAppends === 0 && nearEnd && stalledMs >= 3500) {
+                // Safety net if backend stopped sending chunks without signaling complete
+                completeMsePlayback(state, `watchdog-open-stall ct=${ct.toFixed(2)} bufEnd=${bufEnd.toFixed(2)}`);
+            }
+        }, 150);
+    }
+
+    function resetMsePlayer() {
+        if (!mseState) {
+            return;
+        }
+        const prev = mseState;
+        mseState = null;
+
+        if (prev.watchdogTimer) {
+            clearInterval(prev.watchdogTimer);
+            prev.watchdogTimer = null;
+        }
+
+        try {
+            if (prev.sourceBuffer && prev.mediaSource && prev.mediaSource.readyState === 'open') {
+                if (prev.sourceBuffer.updating) {
+                    prev.sourceBuffer.abort();
+                }
+            }
+        } catch {}
+
+        try {
+            if (prev.video) {
+                prev.video.onended = null;
+                prev.video.onerror = null;
+                prev.video.pause();
+                prev.video.removeAttribute('src');
+                prev.video.load();
+                prev.video.classList.remove('active');
+                prev.video.style.opacity = '0';
+                prev.video.style.zIndex = '2';
+            }
+        } catch {}
+
+        try {
+            if (prev.objectUrl) {
+                URL.revokeObjectURL(prev.objectUrl);
+            }
+        } catch {}
+    }
+
+    function createMseSession(mime, token) {
+        resetMsePlayer();
+
+        // Hide the standby video element while v1 owns the continuous stream.
+        v2.pause();
+        v2.classList.remove('active');
+        v2.style.opacity = '0';
+        v2.style.zIndex = '2';
+
+        const video = v1;
+        const mediaSource = new MediaSource();
+        const objectUrl = URL.createObjectURL(mediaSource);
+
+        let resolveReady;
+        let rejectReady;
+        const readyPromise = new Promise((resolve, reject) => {
+            resolveReady = resolve;
+            rejectReady = reject;
+        });
+
+        const state = {
+            token,
+            mime,
+            video,
+            mediaSource,
+            objectUrl,
+            sourceBuffer: null,
+            readyPromise,
+            appendChain: Promise.resolve(),
+            startedPlayback: false,
+            endedStream: false,
+            appendedCount: 0,
+            pendingAppends: 0,
+            lastTime: -1,
+            lastProgressAt: performance.now(),
+            watchdogTimer: null,
+        };
+        mseState = state;
+
+        video.pause();
+        video.loop = false;
+        video.muted = false;
+        video.defaultMuted = false;
+        video.volume = 1.0;
+        video.autoplay = false;
+        video.controls = false;
+        video.playsInline = true;
+        video.removeAttribute('muted');
+
+        video.onended = () => {
+            completeMsePlayback(state, 'onended');
+        };
+
+        video.onerror = (err) => {
+            console.error('❌ MSE video element error:', err, video.error);
+            if (mseState === state) {
+                resetMsePlayer();
+                isPlaying = false;
+                forceBlinkDuringPlayback = false;
+                showBaseAvatar();
+            }
+        };
+
+        mediaSource.addEventListener('sourceopen', () => {
+            if (mseState !== state) return;
+            try {
+                const sb = mediaSource.addSourceBuffer(mime);
+                sb.mode = 'sequence';
+                state.sourceBuffer = sb;
+                resolveReady(sb);
+            } catch (err) {
+                console.error('❌ MSE addSourceBuffer failed:', err);
+                rejectReady(err);
+            }
+        }, { once: true });
+
+        video.src = objectUrl;
+        video.load();
+        startMseWatchdog(state);
+        return state;
+    }
+
+    function appendBufferAsync(sb, arrayBuffer) {
+        return new Promise((resolve, reject) => {
+            const onUpdateEnd = () => {
+                sb.removeEventListener('updateend', onUpdateEnd);
+                sb.removeEventListener('error', onError);
+                resolve();
+            };
+            const onError = (err) => {
+                sb.removeEventListener('updateend', onUpdateEnd);
+                sb.removeEventListener('error', onError);
+                reject(err);
+            };
+            sb.addEventListener('updateend', onUpdateEnd);
+            sb.addEventListener('error', onError);
+            try {
+                sb.appendBuffer(arrayBuffer);
+            } catch (err) {
+                sb.removeEventListener('updateend', onUpdateEnd);
+                sb.removeEventListener('error', onError);
+                reject(err);
+            }
+        });
+    }
+
+    function enqueueMseChunk(url, mime, token) {
+        if (token !== playbackToken) {
+            return;
+        }
+
+        if (!mseState || mseState.token !== token) {
+            createMseSession(mime, token);
+        }
+
+        const state = mseState;
+        state.pendingAppends += 1;
+        // Start fetching immediately in parallel; append strictly in arrival order.
+        const fetchPromise = fetch(url).then(res => {
+            if (!res.ok) throw new Error(`HTTP ${res.status} fetching ${url}`);
+            return res.arrayBuffer();
+        });
+
+        state.appendChain = state.appendChain.then(async () => {
+            try {
+                if (mseState !== state || token !== playbackToken) return;
+                const [sb, buf] = await Promise.all([state.readyPromise, fetchPromise]);
+                if (mseState !== state || token !== playbackToken) return;
+
+                if (sb.updating) {
+                    await new Promise(resolve => sb.addEventListener('updateend', resolve, { once: true }));
+                }
+                if (mseState !== state || token !== playbackToken) return;
+
+                // Rolling buffer eviction so extended multi-minute monologues never hit MSE quota
+                if (state.video.buffered.length > 0 && state.video.currentTime > 12) {
+                    const pruneEnd = state.video.currentTime - 10;
+                    if (pruneEnd > state.video.buffered.start(0) + 1) {
+                        try {
+                            await new Promise((resolve) => {
+                                const done = () => {
+                                    sb.removeEventListener('updateend', done);
+                                    resolve();
+                                };
+                                sb.addEventListener('updateend', done, { once: true });
+                                sb.remove(0, pruneEnd);
+                            });
+                        } catch (pruneErr) {
+                            console.warn('MSE prune warning:', pruneErr);
+                        }
+                    }
+                }
+                if (mseState !== state || token !== playbackToken) return;
+
+                await appendBufferAsync(sb, buf);
+                state.appendedCount += 1;
+                state.lastProgressAt = performance.now();
+                console.log(`🌊 MSE appended chunk #${state.appendedCount} (${buf.byteLength} bytes, buffered=${state.video.buffered.length ? state.video.buffered.end(state.video.buffered.length - 1).toFixed(2) : 0}s)`);
+
+                if (!state.startedPlayback) {
+                    state.startedPlayback = true;
+                    isPlaying = true;
+                    forceBlinkDuringPlayback = true;
+                    showLipSyncVideo(state.video);
+                    if (window.setLedState) {
+                        window.setLedState('playing');
+                    }
+                    try {
+                        await state.video.play();
+                        console.log('▶️ MSE continuous stream playback started');
+                    } catch (playErr) {
+                        console.error('MSE play() error:', playErr);
+                    }
+                } else if (state.video.paused && !state.video.ended) {
+                    state.video.play().catch(() => {});
+                }
+            } catch (err) {
+                console.error('⚠️ MSE append failed, falling back to standard video queue:', err);
+                if (mseState === state) {
+                    resetMsePlayer();
+                    enqueueVideo(url, token);
+                }
+            } finally {
+                state.pendingAppends = Math.max(0, state.pendingAppends - 1);
+            }
+        });
+    }
+
+    function finishMseStream(token) {
+        if (!mseState || mseState.token !== token) {
+            return;
+        }
+        const state = mseState;
+        state.appendChain = state.appendChain.then(async () => {
+            if (mseState !== state || token !== playbackToken || state.endedStream) return;
+            state.endedStream = true;
+            try {
+                const sb = state.sourceBuffer || await state.readyPromise;
+                if (mseState !== state || token !== playbackToken) return;
+                if (sb && sb.updating) {
+                    await new Promise(resolve => sb.addEventListener('updateend', resolve, { once: true }));
+                }
+                if (mseState !== state || token !== playbackToken) return;
+                if (state.mediaSource && state.mediaSource.readyState === 'open') {
+                    state.mediaSource.endOfStream();
+                    console.log('🏁 MSE endOfStream() signaled after', state.appendedCount, 'chunks');
+                }
+            } catch (err) {
+                console.warn('MSE endOfStream warning:', err);
+            }
+            startMseWatchdog(state);
+        });
+    }
+
+    function enqueueVideo(url, token) {
+        videoQueue.push({ url, token });
+
+        if (!isPlaying) {
+            playNextVideo();
+        }
+    }
+
+    function playNextVideo() {
+        if (videoQueue.length === 0) {
+            isPlaying = false;
+            forceBlinkDuringPlayback = false;
+            showBaseAvatar();
+            window.setLedState('listening');
+            return;
+        }
+
+        const item = videoQueue.shift();
+
+        if (item.token !== playbackToken) {
+            playNextVideo();
+            return;
+        }
+
+        isPlaying = true;
+        forceBlinkDuringPlayback = true;
+        window.setLedState('playing');
+
+        const currentVideo = v1.classList.contains('active') ? v2 : v1;
+        const otherVideo = currentVideo === v1 ? v2 : v1;
+
+        otherVideo.pause();
+        otherVideo.classList.remove('active');
+        otherVideo.style.opacity = '0';
+        otherVideo.style.zIndex = '2';
+
+        currentVideo.pause();
+        currentVideo.loop = false;
+        currentVideo.muted = false;
+        currentVideo.defaultMuted = false;
+        currentVideo.volume = 1.0;
+        currentVideo.autoplay = false;
+        currentVideo.controls = false;
+        currentVideo.playsInline = true;
+        currentVideo.removeAttribute('muted');
+
+        currentVideo.onended = () => {
+            console.log('✅ Chunk ended:', item.url);
+            currentVideo.classList.remove('active');
+            currentVideo.style.opacity = '0';
+            playNextVideo();
+        };
+
+        currentVideo.onerror = (err) => {
+            console.error('Video play error:', err);
+            currentVideo.classList.remove('active');
+            currentVideo.style.opacity = '0';
+            playNextVideo();
+        };
+
+        currentVideo.onloadedmetadata = () => {
+            console.log(
+                '🎬 Metadata:',
+                'duration=', currentVideo.duration,
+                'videoWidth=', currentVideo.videoWidth,
+                'videoHeight=', currentVideo.videoHeight,
+                'muted=', currentVideo.muted,
+                'volume=', currentVideo.volume
+            );
+        };
+
+        let playStarted = false;
+
+        async function triggerPlayback(reason) {
+            if (playStarted) {
+                return;
+            }
+
+            if (item.token !== playbackToken) {
+                return;
+            }
+
+            playStarted = true;
+
+            try {
+                console.log('▶️ Triggering lipsync playback via:', reason, item.url);
+
+                currentVideo.muted = false;
+                currentVideo.defaultMuted = false;
+                currentVideo.volume = 1.0;
+                currentVideo.autoplay = true;
+                currentVideo.controls = false;
+                currentVideo.playsInline = true;
+                currentVideo.setAttribute('playsinline', 'true');
+                currentVideo.removeAttribute('muted');
+
+                showLipSyncVideo(currentVideo);
+                forceBlinkDuringPlayback = true;
+
+                if (window.setLedState) {
+                    window.setLedState('playing');
+                } else {
+                    setProcessing(true);
+                }
+
+                await currentVideo.play();
+
+                console.log('🔊 Lipsync video playback started:', item.url);
+            } catch (err) {
+                console.error('Play promise error:', err);
+                playStarted = false;
+                setTimeout(() => {
+                    triggerPlayback('retry-after-play-error');
+                }, 250);
+            }
+        }
+
+        currentVideo.onloadeddata = () => triggerPlayback('loadeddata');
+        currentVideo.oncanplay = () => triggerPlayback('canplay');
+        currentVideo.oncanplaythrough = () => triggerPlayback('canplaythrough');
+
+        currentVideo.src = item.url;
+        currentVideo.load();
+
+        setTimeout(() => {
+            triggerPlayback('timeout-fallback');
+        }, 400);
+    }
+
+    async function pollAndPlayChunks(sessionId, totalChunks) {
+        const token = playbackToken;
+
+        for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex++) {
+            if (abortCurrentSession || token !== playbackToken) {
+                break;
+            }
+
+            try {
+                const waitRes = await fetch(`${BACKEND_URL}/wait_for_chunk/${sessionId}/${chunkIndex}`);
+                const waitData = await waitRes.json();
+
+                if (!waitData.ready || !waitData.url) {
+                    console.error(`Chunk ${chunkIndex} timeout or missing URL`);
+                    break;
+                }
+
+                const chunkUrl = `${BACKEND_URL}${waitData.url}`;
+
+                console.log('📦 Queueing chunk:', chunkIndex, chunkUrl);
+
+                enqueueVideo(chunkUrl, token);
+            } catch (err) {
+                console.error(`Chunk ${chunkIndex} error:`, err);
+                break;
+            }
+        }
+    }
+
+    async function speakExternalText(text) {
+        if (!text || !text.trim()) {
+            return;
+        }
+
+        if (isPlaying || videoQueue.length > 0 || forceBlinkDuringPlayback || currentAudio) {
+            bargeInStopPlayback('external text');
+        }
+
+        console.log('🗣️ External direct speak:', text);
+
+        clearVideoQueue();
+        abortCurrentSession = false;
+        playbackToken += 1;
+
+        const token = playbackToken;
+
+        setProcessing(true);
+
+        try {
+            const formData = new FormData();
+            formData.append('text', text.trim());
+            formData.append('voice', DEFAULT_VOICE);
+            formData.append('skip_avatar', 'false');
+            formData.append('read_aloud', 'true');
+
+            const response = await fetch(`${BACKEND_URL}/chat`, {
+                method: 'POST',
+                body: formData
+            });
+
+            const result = await response.json();
+
+            if (abortCurrentSession || token !== playbackToken) {
+                setProcessing(false);
+                return;
+            }
+
+            if (result.success && result.session_id && result.total_chunks > 0) {
+                await pollAndPlayChunks(result.session_id, result.total_chunks);
+            } else {
+                throw new Error('No video chunks returned');
+            }
+        } catch (err) {
+            console.error('External speak error:', err);
+            setProcessing(false);
+            showBaseAvatar();
+        }
+    }
+
+    const { ipcRenderer } = require('electron');
+
+    // Phase 1 webpage highlighting bridge.
+    // main.js injects playback code into this avatar window.
+    // That injected code calls window.electronHighlightSync(...).
+    // This forwards chunkStart/chunkTime/chunkEnd back to Electron main,
+    // which then broadcasts them to the Chrome extension over /highlight-sync.
+    window.electronHighlightSync = function electronHighlightSync(message) {
+        try {
+            if (!message || !message.type) {
+                console.warn('Ignoring invalid highlight sync message:', message);
+                return;
+            }
+
+            ipcRenderer.send('highlight-sync', message);
+        } catch (err) {
+            console.warn('Failed to send highlight sync:', err);
+        }
+    };
+
+    ipcRenderer.on('external-text', (event, text) => {
+        console.log('📥 Received external text:', text);
+
+        if (text && text.trim()) {
+            speakExternalText(text);
+        }
+    });
+
+    ipcRenderer.on('voice-record-start', () => {
+        console.log('🎤 Global shortcut: start recording');
+        startRecording();
+    });
+
+    ipcRenderer.on('voice-record-stop-auto', () => {
+        console.log('⏹️ Global shortcut: stop recording and transcribe');
+        stopRecordingAndSend();
+    });
+
+    async function checkHealth() {
+        try {
+            await fetch(`${BACKEND_URL}/voices`);
+        } catch {}
+    }
+
+    setInterval(checkHealth, 30000);
+
+    // Keep idle loop alive whenever no speaking playback is active
+    setInterval(() => {
+        if (isPlaying || mseState || videoQueue.length > 0 || window.__externalReadAloudActive) {
+            return;
+        }
+        if (v1.classList.contains('active') || v2.classList.contains('active')) {
+            showBaseAvatar();
+            return;
+        }
+        if (vIdle && (vIdle.paused || vIdle.ended) && vIdle.readyState >= 2) {
+            playIdleVideo();
+        }
+    }, 2000);
+
+    initializeIdleVideo();
+    showBaseAvatar();
+    syncAvatarProfileFromBackend();
+    setProcessing(false);
+
+    startRealtimeWakewordListener().catch(err => {
+        console.error('Initial realtime wakeword listener failed:', err);
+        scheduleRealtimeReconnect();
+    });
+
+    window.addEventListener('beforeunload', () => {
+        stopRealtimeWakewordListener({ reconnect: false });
+    });
+
+    console.log('Avatar Reader ready: idle video, lipsync overlays, wakeword/VAD listener enabled');
+</script>
+
+</body>
+</html>
