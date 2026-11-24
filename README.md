@@ -2,6 +2,12 @@
 
 A low-latency, 100% local conversational talking-head avatar stack built around **IMTalker** on NVIDIA RTX 5090 (Blackwell SM120), **Windows SAPI / Kokoro neural TTS** (or PocketTTS), **LM Studio SSE streaming**, **faster-whisper + OpenWakeWord**, an always-on-top **Electron desktop client** with a single-stream **MediaSource (`fMP4`)** player, and a **Chrome MV3 read-aloud extension**.
 
+## Demo — Dual-Avatar Mode (Puck + Gretchen)
+
+[![Watch Dual-Avatar Demo — Puck & Gretchen on RTX 5090](docs/IMTalker_Dual_poster.png)](https://github.com/jjmlovesgit/Avatar/raw/main/docs/IMTalker_Dual.mp4)
+
+> **Click the thumbnail above** to play or download [docs/IMTalker_Dual.mp4](docs/IMTalker_Dual.mp4) (`1080p`, `1:51`, H.264 + AAC, `5.68 MB`) — showing **Puck** and **Gretchen** running simultaneously from a single backend with shared room memory, `~1.27 s` TTFA, calm head motion, speaking blinks, and local LM Studio streaming on an RTX 5090.
+
 ## Measured Performance (RTX 5090, 512×512 @ 25 fps)
 
 | Stage / Metric | Verified Result | Notes |
@@ -39,6 +45,8 @@ Avatar/
 ├── scripts/
 │   └── build_blinking_idle.py            # Generates seamless, practically-still, closed-lip blinking idle MP4s from any 512x512 portrait
 └── docs/
+    ├── IMTalker_Dual.mp4                 # 1080p dual-avatar demo recording (Puck + Gretchen, 1:51)
+    ├── IMTalker_Dual_poster.png          # Clickable README preview thumbnail for IMTalker_Dual.mp4
     └── VENUS_AUDIO_ENDPOINT.md           # Operational runbook (Venus Audio + Desktop Avatar Studio + all env vars)
 ```
 
