@@ -4,6 +4,7 @@
   "main": "main.js",
   "scripts": {
     "start": "electron .",
+    "start:dual": "set DUAL_AVATAR=1&& electron .",
     "build": "electron-builder"
   },
   "devDependencies": {

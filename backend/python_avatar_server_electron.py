@@ -63,15 +63,25 @@ else:
 # CONFIGURATION - AVATAR PROFILES & DUAL LLM
 # ============================================
 AVATAR_PROFILE = os.getenv("AVATAR_PROFILE", "").strip().lower()
+DUAL_AVATAR_MODE = (AVATAR_PROFILE == "dual") or (os.getenv("DUAL_AVATAR", "0").lower() in ("1", "true", "yes"))
 _PROFILE_DEFAULTS = {
     "puck": {
         "avatar": "puck_avatar.png",
         "idle": "idle_puck.mp4",
         "tts_backend": "sapi",
-        "sapi_voice": "Paradee am_puck",
+        "sapi_voice": "Andrew (Natural HD)",
+    },
+    "gretchen": {
+        "avatar": "gretchen.png",
+        "idle": "gretchen.mp4",
+        "tts_backend": "sapi",
+        "sapi_voice": "Jenny(Natural)",
     },
 }
-_ACTIVE_PROFILE = _PROFILE_DEFAULTS.get(AVATAR_PROFILE, {})
+_ACTIVE_PROFILE = _PROFILE_DEFAULTS.get(
+    "puck" if AVATAR_PROFILE == "dual" else AVATAR_PROFILE,
+    {},
+)
 
 DEFAULT_AVATAR = os.getenv("VENUS_AVATAR_IMAGE", _ACTIVE_PROFILE.get("avatar", "Johnny-Depp.png"))
 DEFAULT_IDLE_VIDEO = os.getenv("AVATAR_IDLE_VIDEO", _ACTIVE_PROFILE.get("idle", "idle4.mp4"))
@@ -82,7 +92,7 @@ AVATAR_SIZE = (256, 256)
 
 # LM Studio (Default - Conversational)
 LM_STUDIO_URL = "http://localhost:1234/v1/chat/completions"
-LM_STUDIO_MODEL = "qwen2.5-7b-instruct"
+LM_STUDIO_MODEL = os.getenv("LM_STUDIO_MODEL", "dolphin3.0-llama3.1-8b-abliterated")
 #"nvidia/nemotron-3-nano-4b" #"qwen3.5-35b-a3b"#"glm-4.6v-flash" #"gemma-4-31b-it-claude-opus-distill-v2" #"gemma-3n-e4b-it-text" #gemma-4-e4b-it"
 
 OPENCLAW_URL = "http://127.0.0.1:18789/v1/chat/completions"
@@ -112,16 +122,16 @@ WAKE_WORD_DEBOUNCE = 2.0
 WAKE_WORD_TIMEOUT = 10.0  # Auto-deactivate after 10 seconds of silence
 WHISPER_WAKE_ALIAS_ENABLED = os.getenv("WHISPER_WAKE_ALIAS", "1").lower() not in ("0", "false", "no")
 WHISPER_WAKE_PHRASE_RE = re.compile(
-    r"\bhey[\s,.\-!]*(?:jo+h?n+y|jo+n+ie|jo+n+i|puck|jarvis)\b[\s,.\-!:;]*",
+    r"\bhey[\s,.\-!]*(?:jo+h?n+y|jo+n+ie|jo+n+i|puck|gretche?n|gretchin|gretchan|jarvis)\b[\s,.\-!:;]*",
     re.IGNORECASE,
 )
 
 # VAD Configuration
-VAD_AGGRESSIVENESS = 2  # 0-3, higher = more aggressive
+VAD_AGGRESSIVENESS = int(os.getenv("VAD_AGGRESSIVENESS", "3"))  # 0-3, higher = stricter non-speech rejection
 VAD_FRAME_SIZE = 480  # 30ms at 16kHz
-VAD_MIN_SPEECH_FRAMES = 10  # ~300ms minimum speech
+VAD_MIN_SPEECH_FRAMES = int(os.getenv("VAD_MIN_SPEECH_FRAMES", "12"))  # ~360ms minimum speech
 VAD_SILENCE_TIMEOUT_FRAMES = 30  # ~900ms silence timeout
-VAD_NOISE_GATE_THRESHOLD = 150
+VAD_NOISE_GATE_THRESHOLD = int(os.getenv("VAD_NOISE_GATE_THRESHOLD", "350"))  # ignores faint chair creaks/clicks
 
 # GPU Sequential Processing
 GPU_SEQUENTIAL_MODE = True  # Set to False to disable GPU queue
@@ -132,7 +142,9 @@ LLM_MAX_TOKENS = max(150, int(os.getenv("IMTALKER_LLM_MAX_TOKENS", "1000")))
 
 # System Prompts for each LLM
 
-SYSTEM_PROMPT_LM_STUDIO = """You are a real-time conversational avatar speaking to a user.
+PROMPT_CFG_PATH = os.getenv("AVATAR_PROMPT_CFG", os.path.join(os.path.dirname(os.path.abspath(__file__)), "prompt.cfg"))
+
+_DEFAULT_SYSTEM_PROMPT_LM_STUDIO = """You are a real-time conversational avatar speaking to a user.
 
 Your response will be streamed live and lip-synced across consecutive video clips.
 
@@ -160,11 +172,74 @@ Accuracy:
 - If unsure, say you are unsure instead of guessing.
 - Do not invent names, titles, or roles."""
 
-SYSTEM_PROMPT_OPENCLAW = """You are a helpful voice assistant. Answer concisely in 1-2 short sentences.
+_DEFAULT_SYSTEM_PROMPT_OPENCLAW = """You are a helpful voice assistant. Answer concisely in 1-2 short sentences.
 
 Question: {prompt}
 
 Answer:"""
+
+_PROMPT_CFG_CACHE = {
+    "mtime": None,
+    "SYSTEM_PROMPT_LM_STUDIO": _DEFAULT_SYSTEM_PROMPT_LM_STUDIO,
+    "SYSTEM_PROMPT_PUCK": _DEFAULT_SYSTEM_PROMPT_LM_STUDIO,
+    "SYSTEM_PROMPT_GRETCHEN": _DEFAULT_SYSTEM_PROMPT_LM_STUDIO,
+    "SYSTEM_PROMPT_OPENCLAW": _DEFAULT_SYSTEM_PROMPT_OPENCLAW,
+}
+
+_PROMPT_VAR_NAMES = (
+    "SYSTEM_PROMPT_LM_STUDIO",
+    "SYSTEM_PROMPT_PUCK",
+    "SYSTEM_PROMPT_GRETCHEN",
+    "SYSTEM_PROMPT_OPENCLAW",
+)
+
+
+def _reload_prompt_cfg_if_changed():
+    """Safely hot-reload SYSTEM_PROMPT_* variables from prompt.cfg whenever it changes."""
+    import ast
+    if not os.path.isfile(PROMPT_CFG_PATH):
+        return
+    try:
+        mtime = os.path.getmtime(PROMPT_CFG_PATH)
+        if _PROMPT_CFG_CACHE["mtime"] == mtime:
+            return
+        with open(PROMPT_CFG_PATH, "r", encoding="utf-8") as fh:
+            raw = fh.read()
+        tree = ast.parse(raw, filename=PROMPT_CFG_PATH)
+        found = {}
+        for node in tree.body:
+            if isinstance(node, ast.Assign) and isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
+                for target in node.targets:
+                    if isinstance(target, ast.Name) and target.id in _PROMPT_VAR_NAMES:
+                        found[target.id] = node.value.value
+        for var_name in _PROMPT_VAR_NAMES:
+            if var_name in found:
+                _PROMPT_CFG_CACHE[var_name] = found[var_name]
+        _PROMPT_CFG_CACHE["mtime"] = mtime
+        loaded_keys = ", ".join(sorted(found.keys()))
+        print(f"📝 Loaded system prompts from {PROMPT_CFG_PATH} ({loaded_keys})")
+    except Exception as exc:
+        print(f"⚠️ Could not parse {PROMPT_CFG_PATH} (keeping previous prompt): {exc}")
+
+
+def get_system_prompt_lm_studio(avatar_id: Optional[str] = None) -> str:
+    _reload_prompt_cfg_if_changed()
+    aid = (avatar_id or AVATAR_PROFILE or "").strip().lower()
+    if aid == "puck" and _PROMPT_CFG_CACHE.get("SYSTEM_PROMPT_PUCK"):
+        return _PROMPT_CFG_CACHE["SYSTEM_PROMPT_PUCK"]
+    if aid == "gretchen" and _PROMPT_CFG_CACHE.get("SYSTEM_PROMPT_GRETCHEN"):
+        return _PROMPT_CFG_CACHE["SYSTEM_PROMPT_GRETCHEN"]
+    return _PROMPT_CFG_CACHE["SYSTEM_PROMPT_LM_STUDIO"]
+
+
+def get_system_prompt_openclaw() -> str:
+    _reload_prompt_cfg_if_changed()
+    return _PROMPT_CFG_CACHE["SYSTEM_PROMPT_OPENCLAW"]
+
+
+_reload_prompt_cfg_if_changed()
+SYSTEM_PROMPT_LM_STUDIO = _PROMPT_CFG_CACHE["SYSTEM_PROMPT_LM_STUDIO"]
+SYSTEM_PROMPT_OPENCLAW = _PROMPT_CFG_CACHE["SYSTEM_PROMPT_OPENCLAW"]
 
 # ============================================
 # GLOBAL STATE
@@ -172,10 +247,12 @@ Answer:"""
 app = FastAPI()
 agent = None
 avatar_image = None
+avatar_images: Dict[str, Image.Image] = {}
 whisper_model = None
 warmup_complete = False
 wakeword_model = None
 ui_websockets = set()
+display_websockets: Dict[WebSocket, str] = {}
 
 # GPU Management
 gpu_lock = asyncio.Lock()
@@ -188,7 +265,7 @@ active_sessions: Dict[str, 'RealtimeSession'] = {}
 avatar_audio_jobs: Dict[str, Dict] = {}
 
 # ============================================
-# CONVERSATION HISTORY (GLOBAL, SHARED)
+# CONVERSATION HISTORY (GLOBAL, SHARED ROOM MEMORY)
 # ============================================
 conversation_history: List[Dict[str, str]] = []
 MAX_HISTORY_MESSAGES = 12  # keep small for speed
@@ -196,7 +273,7 @@ MAX_HISTORY_MESSAGES = 12  # keep small for speed
 def get_history():
     return conversation_history[-MAX_HISTORY_MESSAGES:]
 
-def add_to_history(user_text: str, assistant_text: str):
+def add_to_history(user_text: str, assistant_text: str, speaker: Optional[str] = None):
     user_text = user_text.strip()
 
     # Skip junk / fragments
@@ -204,10 +281,54 @@ def add_to_history(user_text: str, assistant_text: str):
         return
 
     conversation_history.append({"role": "user", "content": user_text})
-    conversation_history.append({"role": "assistant", "content": assistant_text})
+    if DUAL_AVATAR_MODE and speaker in ("puck", "gretchen"):
+        stored_reply = f"[{speaker.title()}]: {assistant_text}"
+    else:
+        stored_reply = assistant_text
+    conversation_history.append({"role": "assistant", "content": stored_reply})
 
     # Trim
     conversation_history[:] = conversation_history[-MAX_HISTORY_MESSAGES:]
+
+
+async def broadcast_event(session: Optional['RealtimeSession'], payload: dict):
+    """Send a JSON event to the primary session socket and all display-only avatar sockets."""
+    if session is not None and "avatar" not in payload:
+        payload = {**payload, "avatar": getattr(session, "active_avatar", None) or (AVATAR_PROFILE or "johnny")}
+    if session is not None and session.websocket is not None:
+        try:
+            await session.websocket.send_json(payload)
+        except Exception:
+            pass
+    if display_websockets:
+        dead = []
+        for ws in list(display_websockets.keys()):
+            try:
+                await ws.send_json(payload)
+            except Exception:
+                dead.append(ws)
+        for ws in dead:
+            display_websockets.pop(ws, None)
+
+
+_SPEAKER_PREFIX_RE = re.compile(r"^\s*\[?\s*(?:puck|gretchen)\s*\]?\s*[:\-]\s*", re.IGNORECASE)
+_AWAKE_DIRECT_ADDR_RE = re.compile(
+    r"^\s*(?:(?:hey|hi|ok|okay|yo|hey there)[\s,.\-!]*)?(puck|gretche?n|gretchin|gretchan)\b[\s,.\-!:;]*",
+    re.IGNORECASE,
+)
+
+
+def detect_addressed_avatar(text: str) -> Tuple[Optional[str], str]:
+    """Detect if user directly addressed Puck or Gretchen at the start of an utterance."""
+    if not text:
+        return None, ""
+    m = _AWAKE_DIRECT_ADDR_RE.match(text)
+    if not m:
+        return None, text
+    raw_name = m.group(1).lower()
+    target = "puck" if raw_name == "puck" else "gretchen"
+    remainder = text[m.end():].lstrip(" ,.!?:;-").strip()
+    return target, (remainder if remainder else text)
     
 # Setup templates and static files
 templates = Jinja2Templates(directory="templates")
@@ -462,6 +583,7 @@ class RealtimeSession:
         self.current_utterance_id = 0
         self.use_openclaw = False      # LLM toggle
         self.skip_avatar = False       # Skip avatar video, play TTS only
+        self.active_avatar = "puck" if DUAL_AVATAR_MODE else (AVATAR_PROFILE or "johnny")
         
         # VAD settings
         self.vad = webrtcvad.Vad(VAD_AGGRESSIVENESS)
@@ -757,7 +879,7 @@ async def query_llm(prompt: str, use_openclaw: bool = False, perf: PerformanceLo
                     json={
                         "model": OPENCLAW_MODEL,
                         "messages": [
-                            {"role": "user", "content": SYSTEM_PROMPT_OPENCLAW.format(prompt=prompt)}
+                            {"role": "user", "content": get_system_prompt_openclaw().format(prompt=prompt)}
                         ],
                         "temperature": 0.5,
                         "top_p": 0.9,
@@ -802,7 +924,7 @@ async def query_llm(prompt: str, use_openclaw: bool = False, perf: PerformanceLo
                     json={
                         "model": LM_STUDIO_MODEL,
                         "messages": [
-                            {"role": "system", "content": SYSTEM_PROMPT_LM_STUDIO},
+                            {"role": "system", "content": get_system_prompt_lm_studio()},
                             *get_history(),
                             {"role": "user", "content": prompt}
                         ],
@@ -904,7 +1026,11 @@ def _pop_stream_sentence(buf: str, min_chars: int = 28, max_chars: int = 165, fi
     return None, buf
 
 
-async def stream_llm_lm_studio(prompt: str, cancel_event: Optional[asyncio.Event] = None):
+async def stream_llm_lm_studio(
+    prompt: str,
+    cancel_event: Optional[asyncio.Event] = None,
+    avatar_id: Optional[str] = None,
+):
     """Stream spoken sentence chunks directly from LM Studio SSE (`stream: True`)."""
     normalized = prompt.strip().lower()
     effective_prompt = prompt
@@ -916,7 +1042,7 @@ async def stream_llm_lm_studio(prompt: str, cancel_event: Optional[asyncio.Event
         conversation_history.clear()
         effective_prompt = "We are starting a new topic. Please acknowledge briefly and ask what the user wants to discuss next."
 
-    print("   🤖 Streaming from LM Studio (SSE)...")
+    print(f"   🤖 Streaming from LM Studio (SSE, speaker={avatar_id or AVATAR_PROFILE or 'default'})...")
     buf = ""
     full_chunks = []
     emitted_count = 0
@@ -930,7 +1056,7 @@ async def stream_llm_lm_studio(prompt: str, cancel_event: Optional[asyncio.Event
             json={
                 "model": LM_STUDIO_MODEL,
                 "messages": [
-                    {"role": "system", "content": SYSTEM_PROMPT_LM_STUDIO},
+                    {"role": "system", "content": get_system_prompt_lm_studio(avatar_id)},
                     *get_history(),
                     {"role": "user", "content": effective_prompt},
                 ],
@@ -993,19 +1119,23 @@ async def stream_llm_lm_studio(prompt: str, cancel_event: Optional[asyncio.Event
                     if not ready:
                         break
                     clean = _clean_spoken_chunk(ready)
+                    if emitted_count == 0:
+                        clean = _SPEAKER_PREFIX_RE.sub("", clean).strip()
                     if clean:
                         emitted_count += 1
                         full_chunks.append(clean)
                         yield clean
 
         tail = _clean_spoken_chunk(buf)
+        if emitted_count == 0:
+            tail = _SPEAKER_PREFIX_RE.sub("", tail).strip()
         if tail and (cancel_event is None or not cancel_event.is_set()):
             full_chunks.append(tail)
             yield tail
 
         full_text = " ".join(full_chunks).strip()
         if full_text and (cancel_event is None or not cancel_event.is_set()):
-            add_to_history(prompt, full_text)
+            add_to_history(prompt, full_text, speaker=avatar_id)
         elif not full_chunks and (cancel_event is None or not cancel_event.is_set()):
             yield "I'm not sure how to answer that yet."
 
@@ -1093,12 +1223,13 @@ class SapiTtsWorker:
                         sp.Voice = voice_tokens[chosen_desc]
                         current_voice_desc = chosen_desc
                     sp.Rate = rate
+                    sp.Volume = 100
 
                     fs = win32com.client.Dispatch("SAPI.SpFileStream")
                     fs.Open(os.path.abspath(output_path), 3)  # SSFMCreateForWrite = 3
                     try:
                         sp.AudioOutputStream = fs
-                        sp.Speak(text)
+                        sp.Speak(text, 0)
                     finally:
                         fs.Close()
 
@@ -1131,11 +1262,23 @@ async def generate_speech_sapi(text: str, output_path: str, voice_name: Optional
         return False
 
 
-async def generate_speech_pockettts(text: str, output_path: str, voice: str, perf: PerformanceLogger, chunk_idx: int = None) -> bool:
+async def generate_speech_pockettts(
+    text: str,
+    output_path: str,
+    voice: str,
+    perf: PerformanceLogger,
+    chunk_idx: int = None,
+    sapi_voice_override: Optional[str] = None,
+) -> bool:
     # Route to local Windows SAPI when TTS_BACKEND=sapi OR when voice starts with "sapi:"
     use_sapi = (TTS_BACKEND == "sapi") or (isinstance(voice, str) and voice.lower().startswith("sapi:"))
     if use_sapi:
-        sapi_voice_name = voice[5:].strip() if (isinstance(voice, str) and voice.lower().startswith("sapi:")) else SAPI_VOICE
+        if sapi_voice_override:
+            sapi_voice_name = sapi_voice_override
+        elif isinstance(voice, str) and voice.lower().startswith("sapi:"):
+            sapi_voice_name = voice[5:].strip()
+        else:
+            sapi_voice_name = SAPI_VOICE
         if await generate_speech_sapi(text, output_path, voice_name=sapi_voice_name):
             return True
         if TTS_BACKEND == "sapi":
@@ -1166,10 +1309,12 @@ async def render_wav_to_chunk_video(
     fast: bool = False,
     fragmented: bool = False,
     motion_state: Optional[dict] = None,
+    target_avatar_img=None,
 ) -> Optional[str]:
     """Render an already-synthesized WAV file into a video chunk on the GPU."""
     chunk_filename = f"stream_{session_id}_{chunk_index}.mp4"
     chunk_path = os.path.join(CHUNK_DIR, chunk_filename)
+    img_to_use = target_avatar_img if target_avatar_img is not None else avatar_image
 
     if os.path.exists(chunk_path):
         if os.path.exists(wav_path):
@@ -1179,7 +1324,7 @@ async def render_wav_to_chunk_video(
     if fast:
         await run_in_threadpool(
             agent.generate_fast,
-            img_pil=avatar_image,
+            img_pil=img_to_use,
             aud_path=wav_path,
             output_path=chunk_path,
             fragmented=fragmented,
@@ -1189,7 +1334,7 @@ async def render_wav_to_chunk_video(
         std_nfe = max(2, int(os.getenv("IMTALKER_STD_NFE", "6")))
         await run_in_threadpool(
             agent.generate,
-            img_pil=avatar_image,
+            img_pil=img_to_use,
             aud_path=wav_path,
             output_path=chunk_path,
             nfe=std_nfe,
@@ -1369,6 +1514,8 @@ def match_whisper_wake_phrase(text: str) -> Tuple[Optional[str], str]:
         label = "Hey Jarvis"
     elif "puck" in matched_raw:
         label = "Hey Puck"
+    elif "gret" in matched_raw:
+        label = "Hey Gretchen"
     else:
         label = "Hey Jonny"
     remainder = text[match.end():].strip(" ,.!?:;-")
@@ -1409,25 +1556,32 @@ async def check_whisper_wakeword(session: RealtimeSession, pcm_bytes: bytes):
             return
 
         session.last_whisper_wake_time = time.time()
-        print(f"🎯 [{session.session_id}] Whisper wake alias matched '{label}' from: {transcript!r}")
+        if DUAL_AVATAR_MODE:
+            if label == "Hey Puck":
+                session.active_avatar = "puck"
+            elif label == "Hey Gretchen":
+                session.active_avatar = "gretchen"
+        print(f"🎯 [{session.session_id}] Whisper wake alias matched '{label}' (active={session.active_avatar}) from: {transcript!r}")
         await session.activate_wakeword(label=label)
-        await session.websocket.send_json({
+        await broadcast_event(session, {
             "type": "wakeword_detected",
             "status": "activated",
             "word": "hey_jarvis",
             "alias": label.lower().replace(" ", "_"),
+            "avatar": session.active_avatar,
             "message": f"🎯 {label} detected! I'm listening...",
             "timestamp": time.time(),
         })
 
-        # If the user asked a question in the same breath ("Hey Jonny, why is the sky blue?"),
+        # If the user asked a question in the same breath ("Hey Puck, why is the sky blue?"),
         # process the trailing question immediately without requiring a second utterance.
         if len(remainder) >= 3:
             print(f"🎤 [{session.session_id}] One-breath question after '{label}': {remainder}")
-            await session.processing_queue.put({"text": remainder})
-            await session.websocket.send_json({
+            await session.processing_queue.put({"text": remainder, "avatar": session.active_avatar})
+            await broadcast_event(session, {
                 "type": "processing_started",
                 "status": "processing",
+                "avatar": session.active_avatar,
                 "message": f"🤔 Thinking... (via {'OpenClaw' if session.use_openclaw else 'LM Studio'})",
                 "timestamp": time.time(),
             })
@@ -1485,20 +1639,35 @@ async def process_utterance(session: RealtimeSession, payload, utterance_id: int
             session.silence_frames = 0
             return
         
+        # Determine which avatar should answer (wake-word target, awake direct address, or active speaker)
+        if isinstance(payload, dict) and payload.get("avatar"):
+            session.active_avatar = str(payload["avatar"]).strip().lower()
+        if DUAL_AVATAR_MODE:
+            addressed, cleaned_input = detect_addressed_avatar(user_input)
+            if addressed:
+                session.active_avatar = addressed
+                user_input = cleaned_input
+        target_avatar = session.active_avatar
+        target_profile = _PROFILE_DEFAULTS.get(target_avatar, {})
+        target_avatar_img = avatar_images.get(target_avatar, avatar_image)
+        target_sapi_voice = target_profile.get("sapi_voice") if DUAL_AVATAR_MODE else None
+
         # VALID SPEECH - NOW clear video and process
-        print(f"✅ [{utterance_id}] Valid speech detected - interrupting playback")
+        print(f"✅ [{utterance_id}] Valid speech detected (speaker={target_avatar}) - interrupting playback")
         
-        await session.websocket.send_json({
+        await broadcast_event(session, {
             "type": "clear_video",
+            "avatar": target_avatar,
             "utterance": utterance_id,
             "timestamp": time.time()
         })
         
-        print(f"📝 [{utterance_id}] User said: {user_input}")
+        print(f"📝 [{utterance_id}] User said (to {target_avatar}): {user_input}")
         
         # --- IMMEDIATE UI UPDATE WITH USER QUESTION ---
-        await session.websocket.send_json({
+        await broadcast_event(session, {
             "type": "transcript",
+            "avatar": target_avatar,
             "utterance": utterance_id,
             "text": user_input,
             "response": "",           # empty placeholder
@@ -1506,8 +1675,9 @@ async def process_utterance(session: RealtimeSession, payload, utterance_id: int
             "partial": True           # indicates this is just the user part
         })
         
-        await session.websocket.send_json({
+        await broadcast_event(session, {
             "type": "status_update",
+            "avatar": target_avatar,
             "status": "generating",
             "message": f"💬 Generating response... (via {'OpenClaw' if session.use_openclaw else 'LM Studio'})",
             "utterance": utterance_id,
@@ -1517,10 +1687,48 @@ async def process_utterance(session: RealtimeSession, payload, utterance_id: int
         
         utterance_session_id = f"{session.session_id}_utt{utterance_id}"
 
-        def should_cancel_utterance() -> bool:
-            return (not session.is_active) or (not session.processing_queue.empty())
+        interrupt_lock = asyncio.Lock()
+        verified_interruption = False
 
-        # --- 3-STAGE STREAMING PIPELINE: LM Studio SSE -> Parallel PocketTTS -> IMTalker MSE ---
+        async def should_cancel_utterance() -> bool:
+            """Only interrupt active playback on real speech; silently drop short noise/echo bursts."""
+            nonlocal verified_interruption
+            if not session.is_active:
+                return True
+            if verified_interruption:
+                return True
+            if session.processing_queue.empty():
+                return False
+
+            async with interrupt_lock:
+                if verified_interruption:
+                    return True
+                while not session.processing_queue.empty():
+                    try:
+                        queued = session.processing_queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+                    if isinstance(queued, dict) and "text" in queued:
+                        txt = str(queued["text"]).strip()
+                        if len(txt) >= 2:
+                            await session.processing_queue.put(queued)
+                            verified_interruption = True
+                            return True
+                        continue
+                    # Raw PCM16 audio burst: verify with Whisper before killing the active utterance
+                    try:
+                        txt = await run_in_threadpool(_transcribe_pcm16_sync, queued)
+                    except Exception:
+                        txt = ""
+                    if txt and len(txt.strip()) >= 2:
+                        print(f"🎤 [{utterance_id}] Verified real interruption: {txt.strip()!r}")
+                        await session.processing_queue.put({"text": txt.strip()})
+                        verified_interruption = True
+                        return True
+                    print(f"🔇 [{utterance_id}] Ignored short noise burst during playback (not interrupting)")
+                return False
+
+        # --- 3-STAGE STREAMING PIPELINE: LM Studio SSE -> Parallel TTS -> IMTalker MSE ---
         if (not session.use_openclaw) and (not session.skip_avatar) and LLM_STREAMING_ENABLED:
             sentence_queue: asyncio.Queue = asyncio.Queue()
             tts_queue: asyncio.Queue = asyncio.Queue(maxsize=4)
@@ -1530,8 +1738,12 @@ async def process_utterance(session: RealtimeSession, payload, utterance_id: int
             async def _llm_producer():
                 s_idx = 0
                 try:
-                    async for sentence in stream_llm_lm_studio(user_input, cancel_event=cancel_event):
-                        if cancel_event.is_set() or should_cancel_utterance():
+                    async for sentence in stream_llm_lm_studio(
+                        user_input,
+                        cancel_event=cancel_event,
+                        avatar_id=target_avatar,
+                    ):
+                        if cancel_event.is_set() or await should_cancel_utterance():
                             cancel_event.set()
                             break
                         streamed_sentences.append(sentence)
@@ -1541,24 +1753,31 @@ async def process_utterance(session: RealtimeSession, payload, utterance_id: int
                     await sentence_queue.put(None)
 
             async def _tts_producer():
-                """Synthesize PocketTTS WAVs OUTSIDE gpu_lock so Chunk k+1 TTS overlaps with Chunk k render."""
+                """Synthesize TTS WAVs OUTSIDE gpu_lock so Chunk k+1 TTS overlaps with Chunk k render."""
                 try:
                     while True:
                         item = await sentence_queue.get()
                         if item is None:
                             break
                         s_idx, sentence, llm_ready_s = item
-                        if cancel_event.is_set() or should_cancel_utterance():
+                        if cancel_event.is_set() or await should_cancel_utterance():
                             cancel_event.set()
                             break
                         temp_wav = os.path.join(CHUNK_DIR, f"temp_{utterance_session_id}_{s_idx}.wav")
                         t_tts = time.perf_counter()
-                        ok = await generate_speech_pockettts(sentence, temp_wav, session.voice, perf, s_idx)
+                        ok = await generate_speech_pockettts(
+                            sentence,
+                            temp_wav,
+                            session.voice,
+                            perf,
+                            s_idx,
+                            sapi_voice_override=target_sapi_voice,
+                        )
                         tts_ms = (time.perf_counter() - t_tts) * 1000.0
-                        if not ok or cancel_event.is_set() or should_cancel_utterance():
+                        if not ok or cancel_event.is_set() or await should_cancel_utterance():
                             if os.path.exists(temp_wav):
                                 os.remove(temp_wav)
-                            if cancel_event.is_set() or should_cancel_utterance():
+                            if cancel_event.is_set() or verified_interruption:
                                 cancel_event.set()
                                 break
                             continue
@@ -1579,7 +1798,7 @@ async def process_utterance(session: RealtimeSession, payload, utterance_id: int
                     if ready_item is None:
                         break
                     s_idx, sentence, temp_wav, llm_ready_s, tts_ms = ready_item
-                    if should_cancel_utterance():
+                    if await should_cancel_utterance():
                         interrupted = True
                         cancel_event.set()
                         if os.path.exists(temp_wav):
@@ -1588,7 +1807,7 @@ async def process_utterance(session: RealtimeSession, payload, utterance_id: int
                         break
 
                     if chunk_idx == 0:
-                        print(f"🤖 [{utterance_id}] Chunk 0 ({len(sentence)}c): {sentence[:60]}...")
+                        print(f"🤖 [{utterance_id}] Chunk 0 ({target_avatar}, {len(sentence)}c): {sentence[:60]}...")
 
                     t_ren = time.perf_counter()
                     chunk_path = await queue_gpu_task(
@@ -1601,10 +1820,11 @@ async def process_utterance(session: RealtimeSession, payload, utterance_id: int
                         fast=(chunk_idx == 0),
                         fragmented=use_fmp4,
                         motion_state=utterance_motion_state,
+                        target_avatar_img=target_avatar_img,
                     )
                     render_ms = (time.perf_counter() - t_ren) * 1000.0
 
-                    if should_cancel_utterance():
+                    if await should_cancel_utterance():
                         interrupted = True
                         cancel_event.set()
                         print(f"🛑 [{utterance_id}] Interrupted after chunk {chunk_idx} — aborting remaining chunks")
@@ -1613,9 +1833,10 @@ async def process_utterance(session: RealtimeSession, payload, utterance_id: int
                     if chunk_path and os.path.exists(chunk_path):
                         filename = os.path.basename(chunk_path)
                         elapsed_s = time.time() - start_time
-                        print(f"⚡ [{utterance_id}] Chunk {chunk_idx} ready @ {elapsed_s:.2f}s (llm@{llm_ready_s:.2f}s, tts={tts_ms:.0f}ms, render={render_ms:.0f}ms)")
-                        await session.websocket.send_json({
+                        print(f"⚡ [{utterance_id}] Chunk {chunk_idx} ready ({target_avatar}) @ {elapsed_s:.2f}s (llm@{llm_ready_s:.2f}s, tts={tts_ms:.0f}ms, render={render_ms:.0f}ms)")
+                        await broadcast_event(session, {
                             "type": "chunk_ready",
+                            "avatar": target_avatar,
                             "utterance": utterance_id,
                             "chunk": chunk_idx,
                             "total": None,
@@ -1650,33 +1871,37 @@ async def process_utterance(session: RealtimeSession, payload, utterance_id: int
             total_time = time.time() - start_time
 
             if not interrupted:
-                await session.websocket.send_json({
+                await broadcast_event(session, {
                     "type": "transcript",
+                    "avatar": target_avatar,
                     "utterance": utterance_id,
                     "text": user_input,
                     "response": full_response_text,
                     "num_chunks": chunk_idx,
                     "partial": False
                 })
-                await session.websocket.send_json({
+                await broadcast_event(session, {
                     "type": "status_update",
+                    "avatar": target_avatar,
                     "status": "active" if session.is_wakeword_activated else "idle",
-                    "message": "🟢 Listening..." if session.is_wakeword_activated else "💤 Say 'Hey Jarvis'",
+                    "message": "🟢 Listening..." if session.is_wakeword_activated else "💤 Say 'Hey Puck' or 'Hey Gretchen'",
                     "total_time": round(total_time, 2),
                     "timestamp": time.time()
                 })
-                await session.websocket.send_json({
+                await broadcast_event(session, {
                     "type": "complete",
+                    "avatar": target_avatar,
                     "utterance": utterance_id,
                     "total_time": round(total_time, 2)
                 })
-                print(f"✅ [{utterance_id}] Stream complete in {total_time:.2f}s with {chunk_idx} chunks ({len(full_response_text)} chars)")
+                print(f"✅ [{utterance_id}] Stream complete ({target_avatar}) in {total_time:.2f}s with {chunk_idx} chunks ({len(full_response_text)} chars)")
             else:
                 print(f"🛑 [{utterance_id}] Stopped after {chunk_idx} chunks for interruption")
                 if chunk_idx > 0:
                     try:
-                        await session.websocket.send_json({
+                        await broadcast_event(session, {
                             "type": "complete",
+                            "avatar": target_avatar,
                             "utterance": utterance_id,
                             "interrupted": True,
                             "total_time": round(total_time, 2)
@@ -1926,8 +2151,9 @@ async def websocket_realtime(websocket: WebSocket, voice: str):
                     extra = {}
             
             try:
-                await websocket.send_json({
+                await broadcast_event(session, {
                     "type": "status_update",
+                    "avatar": session.active_avatar,
                     "status": status,
                     "message": message,
                     "audio_level": session.last_audio_level,
@@ -1974,6 +2200,16 @@ async def websocket_realtime(websocket: WebSocket, voice: str):
                             "type": "skip_avatar_updated",
                             "skip_avatar": session.skip_avatar
                         })
+                    elif data.get("type") == "select_avatar":
+                        chosen = str(data.get("avatar", "")).strip().lower()
+                        if chosen in _PROFILE_DEFAULTS:
+                            session.active_avatar = chosen
+                            print(f"🎭 [{session_id}] Active avatar selected via UI click: {chosen}")
+                            await broadcast_event(session, {
+                                "type": "active_avatar_changed",
+                                "avatar": chosen,
+                                "timestamp": time.time(),
+                            })
                     continue
                 except:
                     pass
@@ -1999,9 +2235,10 @@ async def websocket_realtime(websocket: WebSocket, voice: str):
                     if session.check_wakeword(frame):
                         await session.activate_wakeword(label="Hey Jarvis")
                         
-                        await websocket.send_json({
+                        await broadcast_event(session, {
                             "type": "wakeword_detected",
                             "status": "activated",
+                            "avatar": session.active_avatar,
                             "message": "🎯 Hey Jarvis detected! I'm listening...",
                             "timestamp": time.time()
                         })
@@ -2036,10 +2273,11 @@ async def websocket_realtime(websocket: WebSocket, voice: str):
                 if WAKE_WORD_ENABLED and session.check_timeout():
                     await session.deactivate_wakeword()
                     
-                    await websocket.send_json({
+                    await broadcast_event(session, {
                         "type": "wakeword_timeout",
                         "status": "idle",
-                        "message": "😴 Going to sleep... Say 'Hey Jarvis' to wake me",
+                        "avatar": session.active_avatar,
+                        "message": "😴 Going to sleep... Say 'Hey Puck' or 'Hey Gretchen' to wake me",
                         "timestamp": time.time()
                     })
                     continue
@@ -2053,9 +2291,10 @@ async def websocket_realtime(websocket: WebSocket, voice: str):
                         session.silence_frames = 0
                         print(f"🎤 [{session_id}] Speech started")
                         
-                        await websocket.send_json({
+                        await broadcast_event(session, {
                             "type": "speech_started",
                             "status": "speaking",
+                            "avatar": session.active_avatar,
                             "message": "🎙️ I hear you...",
                             "timestamp": time.time()
                         })
@@ -2121,6 +2360,48 @@ async def websocket_ui(websocket: WebSocket):
     finally:
         ui_websockets.discard(websocket)
 
+
+@app.websocket("/ws/display/{avatar_id}")
+async def websocket_avatar_display(websocket: WebSocket, avatar_id: str):
+    """Display-only WebSocket for secondary floating avatar windows (no duplicate mic)."""
+    await websocket.accept()
+    aid = avatar_id.strip().lower()
+    display_websockets[websocket] = aid
+    print(f"🖥️ Display avatar connected: {aid} (total displays={len(display_websockets)})")
+    try:
+        active_id = next(iter(active_sessions.values())).active_avatar if active_sessions else ("puck" if DUAL_AVATAR_MODE else (AVATAR_PROFILE or "johnny"))
+        await websocket.send_json({
+            "type": "ready",
+            "status": "idle",
+            "avatar": active_id,
+            "wakeword_enabled": WAKE_WORD_ENABLED,
+            "timestamp": time.time(),
+        })
+        while True:
+            raw = await websocket.receive_text()
+            try:
+                data = json.loads(raw)
+                if data.get("type") == "select_avatar":
+                    chosen = str(data.get("avatar", aid)).strip().lower()
+                    if chosen in _PROFILE_DEFAULTS:
+                        for sess in active_sessions.values():
+                            sess.active_avatar = chosen
+                        print(f"🎭 Active avatar switched to '{chosen}' via display window click")
+                        primary = next(iter(active_sessions.values()), None)
+                        await broadcast_event(primary, {
+                            "type": "active_avatar_changed",
+                            "avatar": chosen,
+                            "timestamp": time.time(),
+                        })
+            except Exception:
+                pass
+    except WebSocketDisconnect:
+        pass
+    finally:
+        display_websockets.pop(websocket, None)
+        print(f"🖥️ Display avatar disconnected: {aid}")
+
+
 # ============================================
 # HTTP ENDPOINTS
 # ============================================
@@ -2173,12 +2454,21 @@ async def avatar_profile():
     """Return active avatar portrait and idle loop so Electron switches automatically."""
     return {
         "profile": AVATAR_PROFILE or "johnny",
+        "dual_mode": DUAL_AVATAR_MODE,
         "avatar_file": os.path.basename(DEFAULT_AVATAR),
         "idle_file": os.path.basename(DEFAULT_IDLE_VIDEO),
         "avatar_url": "/avatar/image",
         "idle_url": "/avatar/idle",
         "tts_backend": TTS_BACKEND,
         "voice": SAPI_VOICE if TTS_BACKEND == "sapi" else POCKET_TTS_VOICE,
+        "profiles": {
+            name: {
+                "avatar_file": os.path.basename(cfg["avatar"]),
+                "idle_file": os.path.basename(cfg["idle"]),
+                "sapi_voice": cfg["sapi_voice"],
+            }
+            for name, cfg in _PROFILE_DEFAULTS.items()
+        },
     }
 
 
@@ -2851,6 +3141,14 @@ async def lifespan(app: FastAPI):
     agent.warmup(avatar_path=DEFAULT_AVATAR)
     if avatar_image is not None:
         agent.set_avatar(avatar_image)
+    if DUAL_AVATAR_MODE:
+        for prof_name, prof_cfg in _PROFILE_DEFAULTS.items():
+            p_path = prof_cfg["avatar"]
+            if os.path.exists(p_path):
+                img = resize_avatar(Image.open(p_path).convert('RGB'), AVATAR_SIZE)
+                avatar_images[prof_name] = img
+                agent.set_avatar(img)
+                print(f"✅ Dual-avatar pre-cached '{prof_name}' ({p_path})")
     # ======================================================
 
     # ---------- SAFE AUDIO PIPELINE WARMUP (fixed) ----------
@@ -2926,14 +3224,21 @@ async def lifespan(app: FastAPI):
     except:
         print("⚠️ OpenClaw not responding (will use LM Studio as fallback)")
     if TTS_BACKEND == "sapi":
-        print(f"\n🔥 Warming up Windows SAPI TTS voice: {SAPI_VOICE}...")
-        warm_wav = os.path.join(CHUNK_DIR, "warmup_sapi.wav")
-        if await generate_speech_sapi("Hello.", warm_wav, voice_name=SAPI_VOICE):
-            print(f"✅ Windows SAPI voice '{SAPI_VOICE}' warmed up (local neural TTS active)")
-            if os.path.exists(warm_wav):
-                os.remove(warm_wav)
-        else:
-            print(f"⚠️ SAPI warmup failed for '{SAPI_VOICE}'")
+        voices_to_warm = [SAPI_VOICE]
+        if DUAL_AVATAR_MODE:
+            for prof_cfg in _PROFILE_DEFAULTS.values():
+                v = prof_cfg.get("sapi_voice")
+                if v and v not in voices_to_warm:
+                    voices_to_warm.append(v)
+        for v_warm in voices_to_warm:
+            print(f"\n🔥 Warming up Windows SAPI TTS voice: {v_warm}...")
+            warm_wav = os.path.join(CHUNK_DIR, "warmup_sapi.wav")
+            if await generate_speech_sapi("Hello.", warm_wav, voice_name=v_warm):
+                print(f"✅ Windows SAPI voice '{v_warm}' warmed up (local neural TTS active)")
+                if os.path.exists(warm_wav):
+                    os.remove(warm_wav)
+            else:
+                print(f"⚠️ SAPI warmup failed for '{v_warm}'")
     else:
         try:
             async with httpx.AsyncClient() as client:
@@ -2952,9 +3257,11 @@ async def lifespan(app: FastAPI):
     print("📍 http://localhost:8002")
     print("📍 WebSocket: ws://localhost:8002/ws/realtime/{voice}")
     print(f"🎤 VAD: Aggressiveness={VAD_AGGRESSIVENESS}, Silence=900ms")
-    print(f"🎯 Wake Word: {'Enabled (Hey Jarvis + Hey Jonny)' if WAKE_WORD_ENABLED else 'Disabled'}")
+    print(f"🎯 Wake Word: {'Enabled (Hey Jarvis + Hey Jonny + Hey Puck + Hey Gretchen)' if WAKE_WORD_ENABLED else 'Disabled'}")
     print(f"📚 Wake Word Library: {'livekit-wakeword' if LIVEKIT_WAKEWORD_AVAILABLE else 'none'}")
     print(f"🔊 TTS Backend: {TTS_BACKEND} ({SAPI_VOICE if TTS_BACKEND == 'sapi' else POCKET_TTS_VOICE})")
+    if DUAL_AVATAR_MODE:
+        print(f"🎭 Dual-Avatar Mode: ACTIVE (Puck + Gretchen pre-cached, shared room memory)")
     print(f"🤖 LLM: LM Studio (SSE Stream) + OpenClaw (Toggle)")
     print(f"🎮 GPU Worker: {'Sequential' if GPU_SEQUENTIAL_MODE else 'Parallel'} mode")
     print(f"🎬 Skip Avatar Toggle: Available (Voice/Text can bypass video)")

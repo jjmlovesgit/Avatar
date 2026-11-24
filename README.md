@@ -81,20 +81,25 @@ pip install -r requirements.txt
 pip install pywin32  # Required for in-process Windows SAPI neural TTS
 ```
 
-### 2. Launch the Avatar Backend (Puck Profile + Local SAPI Neural Voice)
+### 2. Launch the Avatar Backend (Dual Mode or Single Profile)
+
+Both `gretchen` and `puck` profiles include our tuned defaults (`IMTALKER_POSE_MODE=calm`, `IMTALKER_POSE_WEIGHT=0.45`, `IMTALKER_CFG_SCALE=2.6`, `IMTALKER_SPEAK_BLINK=1`, `VAD_AGGRESSIVENESS=3`, `VAD_NOISE_GATE_THRESHOLD=350`, `VAD_MIN_SPEECH_FRAMES=12`, `LM_STUDIO_MODEL=dolphin3.0-llama3.1-8b-abliterated`, hot-reloaded `prompt.cfg`):
 
 ```powershell
 cd backend
 conda activate avatar
-$env:AVATAR_PROFILE = 'puck'
-$env:TTS_BACKEND = 'sapi'
-$env:SAPI_VOICE = 'Paradee am_puck'
-$env:IMTALKER_MSE_STREAMING = '1'
-$env:IMTALKER_LLM_STREAMING = '1'
+
+# Dual-Avatar Mode: Puck + Gretchen simultaneously (1 backend, shared room memory, 0 ms switching)
+$env:AVATAR_PROFILE = 'dual'
+$env:TTS_BACKEND    = 'sapi'
 python python_avatar_server_electron.py
+
+# Or single avatar: 'gretchen' (Jenny(Natural)) or 'puck' (Andrew (Natural HD))
+# $env:AVATAR_PROFILE = 'gretchen'
 ```
 
 - Switch back to the default Johnny portrait & idle loop at any time by omitting `AVATAR_PROFILE` (or setting `$env:AVATAR_PROFILE = 'johnny'`).
+- Override voice anytime with `$env:SAPI_VOICE = 'Aria (Natural)'` / `'Paradee bf_isabella'` / `'Paradee am_puck'` / `'Ryan (Natural)'`.
 - For focused Venus audio-only rendering (`/avatar/audio` without Whisper/LLM/TTS), run `python python_venus_avatar_server.py` — see [docs/VENUS_AUDIO_ENDPOINT.md](docs/VENUS_AUDIO_ENDPOINT.md).
 
 ### 3. Launch the Electron Desktop Avatar
@@ -102,7 +107,8 @@ python python_avatar_server_electron.py
 ```powershell
 cd electron
 npm install
-npm start
+npm start            # Single window (or auto-opens 2 draggable windows when backend runs AVATAR_PROFILE=dual)
+# npm run start:dual # Explicit 2 independent floating windows (Puck primary + Gretchen display-only)
 ```
 
 The Electron client automatically calls `GET http://localhost:8002/avatar/profile` on startup to load the active portrait and seamless blinking idle loop, connects to `/ws/realtime/jonnydepp` for wake-word (`Hey Jarvis` / `Hey Jonny` / `Hey Puck`) and VAD streaming, and plays continuous fragmented MP4 chunks over a single `MediaSource` element with automatic EOF recovery back to idle.
@@ -132,14 +138,21 @@ python scripts/build_blinking_idle.py `
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `AVATAR_PROFILE` | `johnny` | Active avatar preset (`johnny` or `puck`; exposed via `GET /avatar/profile`) |
-| `TTS_BACKEND` | `pockettts` | `sapi` (in-process Windows SAPI / Kokoro neural voices, ~80–90 ms) or `pockettts` (`localhost:8000`) |
-| `SAPI_VOICE` | `Paradee am_puck` | Voice name or substring when `TTS_BACKEND=sapi` |
+| `AVATAR_PROFILE` | `johnny` | Active avatar preset (`gretchen`, `puck`, or `johnny`; auto-syncs Electron via `GET /avatar/profile`) |
+| `TTS_BACKEND` | `pockettts` | `sapi` (offline MS Natural / Paradee neural voices, ~56–90 ms) or `pockettts` (`localhost:8000`) |
+| `SAPI_VOICE` | `Jenny(Natural)` *(gretchen)* / `Andrew (Natural HD)` *(puck)* | Voice name or substring when `TTS_BACKEND=sapi` |
+| `AVATAR_PROMPT_CFG` | `prompt.cfg` | System prompt config file (`SYSTEM_PROMPT_LM_STUDIO`; hot-reloads on edit without restarting) |
+| `LM_STUDIO_MODEL` | `dolphin3.0-llama3.1-8b-abliterated` | LM Studio model ID for SSE streaming & chat completions |
+| `IMTALKER_POSE_MODE` | `calm` | Head movement conditioning (`calm`, `still`, or `free`) |
+| `IMTALKER_POSE_WEIGHT` | `0.45` | Pose conditioning blend weight (`0.45` calms head motion ~35% while keeping full wide lip articulation) |
+| `IMTALKER_CFG_SCALE` | `2.6` *(calm)* / `2.0` *(free)* | Audio lip-sync CFG guidance scale (higher = wider lip articulation) |
+| `IMTALKER_SPEAK_BLINK` | `1` | Natural periodic speaking blinks (~every `3.4 s`) via `driver_video/blink_delta.pt` (+0 ms latency) |
+| `VAD_AGGRESSIVENESS` / `VAD_NOISE_GATE_THRESHOLD` / `VAD_MIN_SPEECH_FRAMES` | `3` / `350` / `12` | WebRTC VAD strictness and noise gate (filters out chair creaks and ambient clicks) |
 | `IMTALKER_FAST_NFE` / `IMTALKER_STD_NFE` | `6` / `6` | Flow-matching ODE solver steps for chunk 0 and chunks 1+ |
 | `IMTALKER_BF16` | `1` | Hybrid BF16 (`SynthesisNetwork` only) with FP32 encoders, `MotionDecoder`, and `CrossAttention` |
 | `IMTALKER_RENDER_BATCH` | `8` | GPU frame decode micro-batch size |
 | `IMTALKER_NVENC` | `1` | Hardware `h264_nvenc` encoding (`0` = CPU `libx264`) |
 | `IMTALKER_MSE_STREAMING` | `1` | Fragmented MP4 (`fMP4`) streaming for Electron's single-stream MSE player |
 | `IMTALKER_LLM_STREAMING` | `1` | Sentence-by-sentence LM Studio SSE streaming (`IMTALKER_LLM_MAX_TOKENS=1000`) |
-| `WHISPER_WAKE_ALIAS` | `1` | Enables `"Hey Jonny"` / `"Hey Johnny"` / `"Hey Puck"` Whisper wake alias alongside `hey_jarvis_v0.1.onnx` |
+| `WHISPER_WAKE_ALIAS` | `1` | Enables `"Hey Gretchen"` / `"Hey Puck"` / `"Hey Jonny"` / `"Hey Johnny"` Whisper wake alias alongside `hey_jarvis_v0.1.onnx` |
 | `IMTALKER_FORCE_LOCAL` | `0` | Set `1` to enable local CUDA rendering on non-Blackwell (RTX 30/40) GPUs |

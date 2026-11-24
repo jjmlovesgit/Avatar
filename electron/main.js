@@ -6,14 +6,42 @@ const WebSocket = require('ws');
 app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required');
 
 let avatarWindow = null;
+let secondaryAvatarWindow = null;
 let isRecording = false;
 let visibilityCheckInterval;
+let secondaryVisibilityInterval = null;
 let externalHttpServer = null;
 let highlightWss = null;
 const highlightClients = new Set();
 
 const BACKEND_URL = 'http://127.0.0.1:8002';
 let currentVoice = 'jonnydepp';
+
+function detectDualAvatarMode() {
+  const envVal = String(process.env.DUAL_AVATAR || '').trim().toLowerCase();
+  if (['1', 'true', 'yes'].includes(envVal)) {
+    return Promise.resolve(true);
+  }
+  if (['0', 'false', 'no'].includes(envVal)) {
+    return Promise.resolve(false);
+  }
+  return new Promise((resolve) => {
+    const req = http.get(`${BACKEND_URL}/avatar/profile`, { timeout: 800 }, (res) => {
+      let body = '';
+      res.on('data', (chunk) => { body += chunk; });
+      res.on('end', () => {
+        try {
+          const cfg = JSON.parse(body);
+          resolve(Boolean(cfg && cfg.dual_mode));
+        } catch {
+          resolve(false);
+        }
+      });
+    });
+    req.on('timeout', () => { req.destroy(); resolve(false); });
+    req.on('error', () => resolve(false));
+  });
+}
 
 function broadcastHighlightSync(message) {
   const payload = JSON.stringify(message);
@@ -51,13 +79,108 @@ function setLedState(state) {
   `).catch(() => {});
 }
 
-function createWindow() {
+function createSecondaryAvatarWindow(avatarId, xPos, yPos = 0) {
+  const avatarWidth = 260;
+  const avatarHeight = 330;
+
+  secondaryAvatarWindow = new BrowserWindow({
+    width: avatarWidth,
+    height: avatarHeight,
+    x: xPos,
+    y: yPos,
+    transparent: true,
+    frame: false,
+    alwaysOnTop: true,
+    focusable: true,
+    resizable: false,
+    skipTaskbar: true,
+    backgroundColor: '#00000000',
+    type: 'toolbar',
+    show: false,
+    minWidth: avatarWidth,
+    maxWidth: avatarWidth,
+    minHeight: avatarHeight,
+    maxHeight: avatarHeight,
+    webPreferences: {
+      nodeIntegration: true,
+      contextIsolation: false,
+      webSecurity: false,
+      partition: 'persist:imtalker',
+      autoplayPolicy: 'no-user-gesture-required'
+    }
+  });
+
+  secondaryAvatarWindow.setIgnoreMouseEvents(false);
+  console.log(`📐 Secondary avatar window (${avatarId}) positioned at (${xPos}, ${yPos}) with size ${avatarWidth}x${avatarHeight}`);
+
+  const pinSecondary = () => {
+    if (!secondaryAvatarWindow || secondaryAvatarWindow.isDestroyed()) return;
+    for (const level of ['screen-saver', 'modal-panel', 'main-menu', 'status', 'pop-up-menu', 'critical']) {
+      try {
+        secondaryAvatarWindow.setAlwaysOnTop(true, level);
+        break;
+      } catch {
+        continue;
+      }
+    }
+    secondaryAvatarWindow.setIgnoreMouseEvents(false);
+    if (!secondaryAvatarWindow.isVisible()) {
+      secondaryAvatarWindow.showInactive();
+    }
+    if (secondaryAvatarWindow.isMinimized()) {
+      secondaryAvatarWindow.restore();
+    }
+  };
+
+  secondaryAvatarWindow.once('ready-to-show', () => {
+    secondaryAvatarWindow.show();
+    pinSecondary();
+    console.log(`👁️ Secondary avatar window (${avatarId}) shown and pinned on top`);
+  });
+
+  secondaryVisibilityInterval = setInterval(() => {
+    if (secondaryAvatarWindow && !secondaryAvatarWindow.isDestroyed()) {
+      pinSecondary();
+    }
+  }, 2000);
+
+  secondaryAvatarWindow.on('blur', () => {
+    if (secondaryAvatarWindow && !secondaryAvatarWindow.isDestroyed()) {
+      secondaryAvatarWindow.setOpacity(0.95);
+      secondaryAvatarWindow.setAlwaysOnTop(true, 'floating');
+    }
+  });
+  secondaryAvatarWindow.on('focus', () => {
+    if (secondaryAvatarWindow && !secondaryAvatarWindow.isDestroyed()) {
+      secondaryAvatarWindow.setOpacity(1.0);
+      secondaryAvatarWindow.setAlwaysOnTop(true, 'normal');
+    }
+  });
+  secondaryAvatarWindow.on('minimize', (event) => {
+    event.preventDefault();
+    pinSecondary();
+  });
+
+  const ts = Date.now();
+  const secondaryUrl = `file://${__dirname}/avatar.html?avatar=${encodeURIComponent(avatarId)}&role=display&t=${ts}`;
+  secondaryAvatarWindow.loadURL(secondaryUrl);
+
+  secondaryAvatarWindow.on('closed', () => {
+    if (secondaryVisibilityInterval) {
+      clearInterval(secondaryVisibilityInterval);
+      secondaryVisibilityInterval = null;
+    }
+    secondaryAvatarWindow = null;
+  });
+}
+
+function createWindow(isDualMode = false) {
   const primaryDisplay = screen.getPrimaryDisplay();
   const { width: screenWidth } = primaryDisplay.workAreaSize;
 
   const avatarWidth = 260;
   const avatarHeight = 330;
-  const xPos = screenWidth - avatarWidth;
+  const xPos = isDualMode ? Math.max(0, screenWidth - avatarWidth * 2 - 16) : (screenWidth - avatarWidth);
 
   avatarWindow = new BrowserWindow({
     width: avatarWidth,
@@ -151,13 +274,24 @@ function createWindow() {
 
   avatarWindow.webContents.session.clearCache().then(() => {
     const timestamp = Date.now();
-    const avatarHtmlPath = `file://${__dirname}/avatar.html?t=${timestamp}`;
+    const avatarHtmlPath = isDualMode
+      ? `file://${__dirname}/avatar.html?avatar=puck&role=primary&t=${timestamp}`
+      : `file://${__dirname}/avatar.html?t=${timestamp}`;
 
     console.log('🚀 Loading avatar window:', avatarHtmlPath);
     avatarWindow.loadURL(avatarHtmlPath);
+    if (isDualMode) {
+      createSecondaryAvatarWindow('gretchen', screenWidth - avatarWidth, 0);
+    }
   }).catch(err => {
     console.error('Cache clear failed:', err);
-    avatarWindow.loadURL(`file://${__dirname}/avatar.html`);
+    const fallbackUrl = isDualMode
+      ? `file://${__dirname}/avatar.html?avatar=puck&role=primary`
+      : `file://${__dirname}/avatar.html`;
+    avatarWindow.loadURL(fallbackUrl);
+    if (isDualMode && !secondaryAvatarWindow) {
+      createSecondaryAvatarWindow('gretchen', screenWidth - avatarWidth, 0);
+    }
   });
 
   avatarWindow.webContents.on('dom-ready', () => {
@@ -1327,7 +1461,9 @@ app.whenReady().then(async () => {
   console.log('🎬 ELECTRON AVATAR - WITH CLICK FIXES + READ-ALOUD PLAYBACK');
   console.log('========================================');
 
-  createWindow();
+  const dualMode = await detectDualAvatarMode();
+  console.log(`🎭 Electron launch mode: ${dualMode ? 'DUAL AVATAR (Puck + Gretchen independent windows)' : 'SINGLE AVATAR'}`);
+  createWindow(dualMode);
   startExternalTextServer();
 });
 
@@ -1337,6 +1473,9 @@ app.on('will-quit', () => {
 
   if (visibilityCheckInterval) {
     clearInterval(visibilityCheckInterval);
+  }
+  if (secondaryVisibilityInterval) {
+    clearInterval(secondaryVisibilityInterval);
   }
 
   if (highlightWss) {

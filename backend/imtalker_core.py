@@ -286,6 +286,7 @@ class LocalInferenceAgent:
         # Force the engine to use the IMTalker frontend class directly
         print("🚀 Forcing IMTalker Frontend (Bypassing Pi0.5 Default)...")
         self.model = IMTalkerTorchFrontendRtx(checkpoint_dir="./checkpoints")
+        self._avatar_tensor_cache = {}
         
         print("✅ Blackwell SM120 Engine Online")
     
@@ -294,6 +295,9 @@ class LocalInferenceAgent:
         s_pil = self.data_processor.process_img(avatar_pil)
         s = self.data_processor.transform_tensor(s_pil).unsqueeze(0).to(self.device)
         self.cached_avatar_tensor = s
+        if not hasattr(self, "_avatar_tensor_cache"):
+            self._avatar_tensor_cache = {}
+        self._avatar_tensor_cache[id(avatar_pil)] = s
 
         if hasattr(self.model, 'set_avatar'):
             self.model.set_avatar(s)
@@ -402,8 +406,17 @@ class LocalInferenceAgent:
 
         t0 = time.time()
         
-        # Use cached tensor if available, otherwise process it fresh
-        if hasattr(self, 'cached_avatar_tensor'):
+        # Use per-image cached tensor if available (supports instant multi-avatar switching)
+        tensor_cache = getattr(self, "_avatar_tensor_cache", None)
+        if tensor_cache is not None and img_pil is not None and id(img_pil) in tensor_cache:
+            s = tensor_cache[id(img_pil)]
+        elif img_pil is not None and tensor_cache is not None and len(tensor_cache) > 0:
+            s_pil = self.data_processor.process_img(img_pil)
+            s = self.data_processor.transform_tensor(s_pil).unsqueeze(0).to(self.device)
+            if len(tensor_cache) >= 8:
+                tensor_cache.pop(next(iter(tensor_cache)))
+            tensor_cache[id(img_pil)] = s
+        elif hasattr(self, 'cached_avatar_tensor'):
             s = self.cached_avatar_tensor
         else:
             s_pil = self.data_processor.process_img(img_pil)
@@ -497,8 +510,17 @@ class LocalInferenceAgent:
 
         t0 = time.time()
         
-        # Use cached tensor if available, otherwise process it fresh
-        if hasattr(self, 'cached_avatar_tensor'):
+        # Use per-image cached tensor if available (supports instant multi-avatar switching)
+        tensor_cache = getattr(self, "_avatar_tensor_cache", None)
+        if tensor_cache is not None and img_pil is not None and id(img_pil) in tensor_cache:
+            s = tensor_cache[id(img_pil)]
+        elif img_pil is not None and tensor_cache is not None and len(tensor_cache) > 0:
+            s_pil = self.data_processor.process_img(img_pil)
+            s = self.data_processor.transform_tensor(s_pil).unsqueeze(0).to(self.device)
+            if len(tensor_cache) >= 8:
+                tensor_cache.pop(next(iter(tensor_cache)))
+            tensor_cache[id(img_pil)] = s
+        elif hasattr(self, 'cached_avatar_tensor'):
             s = self.cached_avatar_tensor
         else:
             s_pil = self.data_processor.process_img(img_pil)

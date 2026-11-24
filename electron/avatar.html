@@ -192,7 +192,22 @@
 <script>
     const BACKEND_URL = 'http://localhost:8002';
     const DEFAULT_VOICE = 'jonnydepp';
-    let IDLE_VIDEO_SRC = 'idle4.mp4';
+    const _urlParams = new URLSearchParams(window.location.search);
+    const AVATAR_ID = (_urlParams.get('avatar') || '').trim().toLowerCase();
+    const AVATAR_ROLE = (_urlParams.get('role') || 'primary').trim().toLowerCase();
+    const IS_DUAL_WINDOW = Boolean(AVATAR_ID);
+    const _LOCAL_AVATAR_DEFAULTS = {
+        puck: { avatar_file: 'puck_avatar.png', idle_file: 'idle_puck.mp4' },
+        gretchen: { avatar_file: 'gretchen.png', idle_file: 'gretchen.mp4' },
+    };
+    let IDLE_VIDEO_SRC = (_LOCAL_AVATAR_DEFAULTS[AVATAR_ID] && _LOCAL_AVATAR_DEFAULTS[AVATAR_ID].idle_file) || 'idle4.mp4';
+    if (_LOCAL_AVATAR_DEFAULTS[AVATAR_ID]) {
+        const _initContainer = document.querySelector('.video-container');
+        if (_initContainer) {
+            _initContainer.style.setProperty('--avatar-bg-url', `url('${_LOCAL_AVATAR_DEFAULTS[AVATAR_ID].avatar_file}')`);
+        }
+        document.title = `Avatar - ${AVATAR_ID.charAt(0).toUpperCase() + AVATAR_ID.slice(1)}`;
+    }
 
     async function syncAvatarProfileFromBackend() {
         try {
@@ -200,17 +215,23 @@
             if (!res.ok) return;
             const cfg = await res.json();
             const container = document.querySelector('.video-container');
-            if (container && cfg.avatar_file) {
-                container.style.setProperty('--avatar-bg-url', `url('${cfg.avatar_file}')`);
+            let avatarFile = cfg.avatar_file;
+            let idleFile = cfg.idle_file;
+            if (IS_DUAL_WINDOW && cfg.profiles && cfg.profiles[AVATAR_ID]) {
+                avatarFile = cfg.profiles[AVATAR_ID].avatar_file;
+                idleFile = cfg.profiles[AVATAR_ID].idle_file;
             }
-            if (cfg.idle_file && cfg.idle_file !== IDLE_VIDEO_SRC) {
-                IDLE_VIDEO_SRC = cfg.idle_file;
+            if (container && avatarFile) {
+                container.style.setProperty('--avatar-bg-url', `url('${avatarFile}')`);
+            }
+            if (idleFile && idleFile !== IDLE_VIDEO_SRC) {
+                IDLE_VIDEO_SRC = idleFile;
                 initializeIdleVideo();
                 if (!isPlaying) {
                     playIdleVideo();
                 }
             }
-            console.log('🎭 Synced avatar profile from backend:', cfg.profile, cfg.avatar_file, cfg.idle_file);
+            console.log('🎭 Synced avatar profile from backend:', IS_DUAL_WINDOW ? AVATAR_ID : cfg.profile, avatarFile, idleFile);
         } catch (err) {
             console.warn('Avatar profile sync skipped (using defaults):', err);
         }
@@ -506,14 +527,77 @@ function setWakewordVisual(status) {
         }, delay);
     }
 
+    let displayWs = null;
+    let displayReconnectTimer = null;
+
+    function startDisplayAvatarSocket() {
+        if (displayReconnectTimer) {
+            clearTimeout(displayReconnectTimer);
+            displayReconnectTimer = null;
+        }
+        try {
+            if (displayWs && displayWs.readyState === WebSocket.OPEN) {
+                return;
+            }
+        } catch {}
+
+        const wsUrl = `${BACKEND_URL.replace('http://', 'ws://').replace('https://', 'wss://')}/ws/display/${AVATAR_ID || 'gretchen'}`;
+        displayWs = new WebSocket(wsUrl);
+        displayWs.onopen = () => {
+            console.log(`🖥️ Display WebSocket connected for avatar: ${AVATAR_ID}`);
+        };
+        displayWs.onmessage = event => {
+            try {
+                handleRealtimeMessage(JSON.parse(event.data));
+            } catch (err) {
+                console.warn('Could not parse display message:', event.data, err);
+            }
+        };
+        displayWs.onclose = () => {
+            displayWs = null;
+            displayReconnectTimer = setTimeout(startDisplayAvatarSocket, 1500);
+        };
+        displayWs.onerror = err => {
+            console.warn('Display WebSocket error:', err);
+        };
+    }
+
+    function sendSelectAvatar() {
+        if (!IS_DUAL_WINDOW) return;
+        const msg = JSON.stringify({ type: 'select_avatar', avatar: AVATAR_ID });
+        const sock = (AVATAR_ROLE === 'display') ? displayWs : realtimeWs;
+        if (sock && sock.readyState === WebSocket.OPEN) {
+            sock.send(msg);
+        }
+    }
+
     function handleRealtimeMessage(data) {
+        const targetAvatar = (data.avatar || '').trim().toLowerCase();
+        const isForMe = (!IS_DUAL_WINDOW) || (!targetAvatar) || (targetAvatar === AVATAR_ID);
+
         switch (data.type) {
             case 'ready':
                 console.log('✅ Realtime wakeword ready:', data);
-                setWakewordVisual(data.wakeword_enabled ? 'sleeping' : 'active');
+                setWakewordVisual(data.wakeword_enabled ? 'sleeping' : (isForMe ? 'active' : 'sleeping'));
+                break;
+
+            case 'active_avatar_changed':
+                if (IS_DUAL_WINDOW) {
+                    if (isForMe) {
+                        window.setLedState('active');
+                    } else if (!isPlaying) {
+                        window.setLedState('sleeping');
+                    }
+                }
                 break;
 
             case 'status_update':
+                if (IS_DUAL_WINDOW && !isForMe) {
+                    if (!isPlaying && videoQueue.length === 0) {
+                        window.setLedState('sleeping');
+                    }
+                    break;
+                }
                 if (data.status === 'idle') {
                     setWakewordVisual('sleeping');
                 } else if (data.status === 'active' || data.status === 'speaking' || data.status === 'listening') {
@@ -525,8 +609,12 @@ function setWakewordVisual(status) {
 
             case 'wakeword_activated':
             case 'wakeword_detected':
-                console.log('🎯 Wake word activated');
-                setWakewordVisual('active');
+                console.log('🎯 Wake word activated (target:', targetAvatar || 'default', ')');
+                if (isForMe) {
+                    setWakewordVisual('active');
+                } else if (!isPlaying) {
+                    window.setLedState('sleeping');
+                }
                 break;
 
             case 'wakeword_deactivated':
@@ -537,15 +625,18 @@ function setWakewordVisual(status) {
                 break;
 
             case 'speech_started':
-                if (isPlaying || videoQueue.length > 0 || forceBlinkDuringPlayback || currentAudio) {
-                    bargeInStopPlayback('wakeword speech_started');
-                    realtimeSessionToken = playbackToken;
+                // Do NOT barge-in stop playback on raw VAD speech_started (a chair creak
+                // or breath triggers VAD before Whisper verifies real speech). Wait for the
+                // backend's verified 'clear_video' message after Whisper confirms speech.
+                if (isForMe) {
+                    setWakewordVisual('speaking');
                 }
-                setWakewordVisual('speaking');
                 break;
 
             case 'processing_started':
-                setProcessing(true);
+                if (isForMe) {
+                    setProcessing(true);
+                }
                 break;
 
             case 'clear_video':
@@ -554,7 +645,11 @@ function setWakewordVisual(status) {
                 // token before chunk_ready events arrive. Otherwise the queue
                 // treats realtime chunks as stale and skips playback.
                 realtimeSessionToken = playbackToken;
-                setProcessing(true);
+                if (isForMe) {
+                    setProcessing(true);
+                } else {
+                    window.setLedState('sleeping');
+                }
                 break;
 
             case 'transcript':
@@ -566,6 +661,9 @@ function setWakewordVisual(status) {
                 break;
 
             case 'chunk_ready': {
+                if (!isForMe) {
+                    break;
+                }
                 const url = `${BACKEND_URL}${data.url}`;
                 const mime = data.mime || 'video/mp4; codecs="avc1.42E01F, mp4a.40.2"';
                 console.log('📦 Wakeword realtime chunk ready:', data.chunk, data.format || 'mp4', url);
@@ -580,6 +678,9 @@ function setWakewordVisual(status) {
             }
 
             case 'audio_response':
+                if (!isForMe) {
+                    break;
+                }
                 clearVideoQueue();
                 forceBlinkDuringPlayback = true;
                 setProcessing(true);
@@ -593,6 +694,9 @@ function setWakewordVisual(status) {
                 break;
 
             case 'complete':
+                if (!isForMe) {
+                    break;
+                }
                 console.log('✅ Wakeword realtime response complete');
                 finishMseStream(realtimeSessionToken);
                 // Do not stop blinking here: the backend may send complete as soon
@@ -1496,16 +1600,33 @@ function setWakewordVisual(status) {
     syncAvatarProfileFromBackend();
     setProcessing(false);
 
-    startRealtimeWakewordListener().catch(err => {
-        console.error('Initial realtime wakeword listener failed:', err);
-        scheduleRealtimeReconnect();
-    });
+    if (IS_DUAL_WINDOW) {
+        const wrapper = document.querySelector('.video-wrapper');
+        if (wrapper) {
+            wrapper.style.cursor = 'pointer';
+            wrapper.addEventListener('click', () => sendSelectAvatar());
+        }
+    }
 
-    window.addEventListener('beforeunload', () => {
-        stopRealtimeWakewordListener({ reconnect: false });
-    });
+    if (AVATAR_ROLE === 'display') {
+        startDisplayAvatarSocket();
+        window.addEventListener('beforeunload', () => {
+            if (displayReconnectTimer) clearTimeout(displayReconnectTimer);
+            try { if (displayWs) displayWs.close(1000, 'closing display window'); } catch {}
+        });
+        console.log(`Avatar Reader ready (${AVATAR_ID}, display-only window)`);
+    } else {
+        startRealtimeWakewordListener().catch(err => {
+            console.error('Initial realtime wakeword listener failed:', err);
+            scheduleRealtimeReconnect();
+        });
 
-    console.log('Avatar Reader ready: idle video, lipsync overlays, wakeword/VAD listener enabled');
+        window.addEventListener('beforeunload', () => {
+            stopRealtimeWakewordListener({ reconnect: false });
+        });
+
+        console.log(`Avatar Reader ready (${AVATAR_ID || 'single'}, primary mic + lipsync window)`);
+    }
 </script>
 
 </body>

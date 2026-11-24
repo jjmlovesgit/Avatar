@@ -102,7 +102,7 @@ class FMGenerator(nn.Module):
         return tensor
 
     @torch.no_grad()
-    def sample(self, data, a_cfg_scale=1.0, nfe=10, seed=None, prev_state=None, return_state=False):
+    def sample(self, data, a_cfg_scale=1.0, nfe=10, seed=None, prev_state=None, return_state=False, pose_weight=1.0):
         a, ref_x = data['a'], data['ref_x']
         gaze_raw = data.get('gaze')
         pose_raw = data.get('pose')
@@ -130,7 +130,7 @@ class FMGenerator(nn.Module):
             gaze = torch.zeros(B, T, self.opt.dim_c, device=device)
 
         if pose is not None:
-            pose = self.pose_projection(pose).unsqueeze(0)
+            pose = self.pose_projection(pose).unsqueeze(0) * float(pose_weight)
         else:
             pose = torch.zeros(B, T, self.opt.dim_c, device=device)
 
@@ -144,9 +144,15 @@ class FMGenerator(nn.Module):
         num_chunks = int(math.ceil(T / self.num_frames_for_clip))
         init_prev_x = None
         init_prev_a = None
+        init_prev_pose = None
+        init_prev_gaze = None
         if prev_state is not None and "prev_x" in prev_state and "prev_a" in prev_state:
             init_prev_x = prev_state["prev_x"].to(device=device, dtype=a.dtype)
             init_prev_a = prev_state["prev_a"].to(device=device, dtype=a.dtype)
+            if "prev_pose" in prev_state and prev_state["prev_pose"] is not None:
+                init_prev_pose = prev_state["prev_pose"].to(device=device, dtype=pose.dtype)
+            if "prev_gaze" in prev_state and prev_state["prev_gaze"] is not None:
+                init_prev_gaze = prev_state["prev_gaze"].to(device=device, dtype=gaze.dtype)
 
         for t in range(num_chunks):
             # Setup Initial Noise
@@ -166,8 +172,14 @@ class FMGenerator(nn.Module):
                 else:
                     prev_x_t = torch.zeros(B, self.num_prev_frames, self.opt.dim_c, device=device)
                     prev_a_t = torch.zeros(B, self.num_prev_frames, self.opt.dim_w, device=device)
-                prev_gaze_t = torch.zeros(B, self.num_prev_frames, gaze.shape[-1], device=device)
-                prev_pose_t = torch.zeros(B, self.num_prev_frames, pose.shape[-1], device=device)
+                if init_prev_gaze is not None:
+                    prev_gaze_t = init_prev_gaze[:, -self.num_prev_frames:]
+                else:
+                    prev_gaze_t = torch.zeros(B, self.num_prev_frames, gaze.shape[-1], device=device)
+                if init_prev_pose is not None:
+                    prev_pose_t = init_prev_pose[:, -self.num_prev_frames:]
+                else:
+                    prev_pose_t = torch.zeros(B, self.num_prev_frames, pose.shape[-1], device=device)
                 prev_cam_t = torch.zeros(B, self.num_prev_frames, cam.shape[-1], device=device)
             else:
                 prev_x_t = sample_t[:, -self.num_prev_frames:]
@@ -224,12 +236,23 @@ class FMGenerator(nn.Module):
             if T >= self.num_prev_frames:
                 next_prev_x = sample[:, -self.num_prev_frames:].detach()
                 next_prev_a = a[:, -self.num_prev_frames:].detach()
+                next_prev_pose = pose[:, -self.num_prev_frames:].detach()
+                next_prev_gaze = gaze[:, -self.num_prev_frames:].detach()
             else:
                 base_x = init_prev_x if init_prev_x is not None else torch.zeros(B, self.num_prev_frames, self.opt.dim_c, device=device)
                 base_a = init_prev_a if init_prev_a is not None else torch.zeros(B, self.num_prev_frames, self.opt.dim_w, device=device)
+                base_pose = init_prev_pose if init_prev_pose is not None else torch.zeros(B, self.num_prev_frames, pose.shape[-1], device=device)
+                base_gaze = init_prev_gaze if init_prev_gaze is not None else torch.zeros(B, self.num_prev_frames, gaze.shape[-1], device=device)
                 next_prev_x = torch.cat([base_x, sample], dim=1)[:, -self.num_prev_frames:].detach()
                 next_prev_a = torch.cat([base_a, a], dim=1)[:, -self.num_prev_frames:].detach()
-            return sample, {"prev_x": next_prev_x, "prev_a": next_prev_a}
+                next_prev_pose = torch.cat([base_pose, pose], dim=1)[:, -self.num_prev_frames:].detach()
+                next_prev_gaze = torch.cat([base_gaze, gaze], dim=1)[:, -self.num_prev_frames:].detach()
+            return sample, {
+                "prev_x": next_prev_x,
+                "prev_a": next_prev_a,
+                "prev_pose": next_prev_pose,
+                "prev_gaze": next_prev_gaze,
+            }
         return sample
 
 
